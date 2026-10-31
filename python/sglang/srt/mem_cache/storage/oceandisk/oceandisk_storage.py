@@ -574,10 +574,7 @@ class OceanDiskStorage(HiCacheStorage):
                     step = time.perf_counter()
                     gpu = cpu.to(self.device)
                     upload_ms += (time.perf_counter() - step) * 1000
-                    events = [
-                        torch.cuda.Event(enable_timing=perf_context is not None)
-                        for _ in layers
-                    ]
+                    events = [torch.cuda.Event() for _ in layers]
                     for event in events:
                         event.record(self._get_stream)
                     submitted.append((cpu, gpu, events))
@@ -589,7 +586,7 @@ class OceanDiskStorage(HiCacheStorage):
                         od_utils,
                     )
                 if perf_context is not None:
-                    task, pending_puts, record_load_event = perf_context
+                    task, pending_puts = perf_context
                     submit_pending_start = pending_puts()
                 dispatch_started = time.perf_counter()
                 for cpu, gpu, events in submitted:
@@ -625,8 +622,6 @@ class OceanDiskStorage(HiCacheStorage):
                         pending_puts(),
                     )
                 for layer in range(len(layers)):
-                    if perf_context is not None:
-                        pending_start = pending_puts()
                     # A layer is usable only after every I/O batch containing
                     # its paired KV/Indexer fragments has completed.
                     step = time.perf_counter()
@@ -634,28 +629,16 @@ class OceanDiskStorage(HiCacheStorage):
                         events[layer].synchronize()
                     layer_wait_ms = (time.perf_counter() - step) * 1000
                     event_wait_ms += layer_wait_ms
-                    if perf_context is not None:
-                        ready_after_submit_ms = (
-                            time.perf_counter() - dispatch_started
-                        ) * 1000
-                        pending_end = pending_puts()
                     if layer in (0, len(layers) - 1):
                         trace_event("GET_LAYER_READY", layer=layer)
-                    if perf_context is not None:
-                        record_load_event(task, layer, submitted[0][2][layer])
                     if on_layer_ready is not None:
                         on_layer_ready(layer)
                     if perf_context is not None:
                         logger.info(
-                            "[OceanDisk PERF GET LAYER] task=%s layer=%d "
-                            "event_wait_ms=%.3f ready_after_submit_ms=%.3f "
-                            "pending_put_start=%d pending_put_end=%d",
+                            "[OceanDisk PERF GET LAYER] task=%s layer=%d event_wait_ms=%.3f",
                             task,
                             layer,
                             layer_wait_ms,
-                            ready_after_submit_ms,
-                            pending_start,
-                            pending_end,
                         )
                     if layer == 0:
                         first_layer_ms = (time.perf_counter() - started) * 1000

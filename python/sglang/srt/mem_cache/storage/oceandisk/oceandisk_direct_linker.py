@@ -8,7 +8,6 @@ import os
 import threading
 import time
 from concurrent.futures import Future
-from contextlib import contextmanager
 from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
@@ -128,17 +127,11 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
-        self._perf_load_events = {}
-        self._perf_layer_session = None
+        self._perf_waits = {}
 
     def update_producer(self) -> int:
         self.producer_index += 1
         self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        if (
-            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-            and get_tensor_model_parallel_rank() == 0
-        ):
-            self._perf_load_events[self.producer_index] = [None] * self.num_layers
         return self.producer_index
 
     def set_consumer(self, index: int) -> None:
@@ -169,119 +162,33 @@ class LayerWiseLoadCounter:
         finally:
             if perf_trace:
                 wait_ms = (time.perf_counter() - wait_start) * 1000
-                session = self._perf_layer_session
-                if session is not None:
-                    session["waits"][threshold] = (
-                        session["waits"].get(threshold, 0.0) + wait_ms
+                waits = self._perf_waits.setdefault(index, {})
+                if threshold not in waits:
+                    waits[threshold] = wait_ms
+                    logger.info(
+                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
+                        index,
+                        threshold,
+                        wait_ms,
                     )
-                logger.info(
-                    "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
-                    index,
-                    threshold,
-                    wait_ms,
-                )
+                if threshold == self.num_layers - 1:
+                    self._perf_waits.pop(index, None)
+            if threshold == self.num_layers - 1:
+                for layer, total_ms in sorted(waits.items()):
+                    logger.info(
+                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
+                        index,
+                        layer,
+                        total_ms,
+                    )
+                self._perf_waits.pop(index, None)
             if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
-
-    def perf_load_event(self, index, layer, event):
-        events = self._perf_load_events.get(index)
-        if events is not None:
-            events[layer] = event
-
-    def perf_layer_start(self, layer):
-        session = self._perf_layer_session
-        if session is None or torch.cuda.is_current_stream_capturing():
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        return event
-
-    def perf_layer_end(self, layer, start):
-        if start is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        self._perf_layer_session["layers"].append((layer, start, end))
-
-    @contextmanager
-    def perf_forward(self, batch, forward_id):
-        if (
-            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") != "1"
-            or get_tensor_model_parallel_rank() != 0
-        ):
-            yield
-            return
-        pending = getattr(self, "_perf_forwards", [])
-        remaining = []
-        for start, end, details, session in pending:
-            if end.query():
-                logger.info(
-                    "[OceanDisk PERF FORWARD GPU] forward=%d task=%d mode=%s gpu_ms=%.3f",
-                    *details,
-                    start.elapsed_time(end),
-                )
-                for layer, layer_start, layer_end in session["layers"]:
-                    load = (
-                        session["loads"][layer]
-                        if session["loads"] is not None
-                        else None
-                    )
-                    load_ms = (
-                        f"{start.elapsed_time(load):.3f}"
-                        if load is not None and load.query()
-                        else "NA"
-                    )
-                    logger.info(
-                        "[OceanDisk PERF OVERLAP] forward=%d task=%d layer=%d "
-                        "load_ready_ms=%s layer_start_ms=%.3f layer_end_ms=%.3f "
-                        "layer_gpu_ms=%.3f cpu_load_wait_ms=%.3f",
-                        details[0],
-                        details[1],
-                        layer,
-                        load_ms,
-                        start.elapsed_time(layer_start),
-                        start.elapsed_time(layer_end),
-                        layer_start.elapsed_time(layer_end),
-                        session["waits"].get(layer, 0.0),
-                    )
-            else:
-                remaining.append((start, end, details, session))
-        self._perf_forwards = remaining
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        details = (forward_id, self.consumer_index, batch.forward_mode.name)
-        session = dict(
-            loads=self._perf_load_events.get(self.consumer_index), layers=[], waits={}
-        )
-        # The list remains owned by this timing session after map cleanup.
-        self._perf_load_events = {
-            k: v for k, v in self._perf_load_events.items() if k >= self.consumer_index
-        }
-        self._perf_layer_session = session
-        batch.oceandisk_perf_counter = self
-        start.record()
-        cpu_start = time.perf_counter()
-        try:
-            yield
-        except BaseException:
-            raise
-        else:
-            cpu_ms = (time.perf_counter() - cpu_start) * 1000
-            end.record()
-            self._perf_forwards.append((start, end, details, session))
-            logger.info(
-                "[OceanDisk PERF FORWARD CPU] forward=%d task=%d mode=%s cpu_ms=%.3f",
-                *details,
-                cpu_ms,
-            )
-
-        finally:
-            self._perf_layer_session = None
-            batch.oceandisk_perf_counter = None
 
     def reset(self) -> None:
         self.producer_index = self.consumer_index = -1
         self.futures.clear()
+        self._perf_waits.clear()
 
 
 class OceanDiskDirectLinker(UnifiedCacheLinker):
@@ -756,7 +663,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 perf_kwargs["perf_context"] = (
                     counter_index,
                     self.pending_offload_tasks,
-                    self.layer_done_counter.perf_load_event,
                 )
             self.storage.get_layers(
                 layers,
