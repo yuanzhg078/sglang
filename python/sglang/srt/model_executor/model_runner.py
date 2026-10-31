@@ -1664,7 +1664,16 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        perf_forward = getattr(counter, "perf_forward", None)
+        perf_ctx = (
+            perf_forward(forward_batch, self.forward_pass_id)
+            if perf_forward is not None
+            else contextlib.nullcontext()
+        )
+
         with (
+            perf_ctx,
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(

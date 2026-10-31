@@ -2434,6 +2434,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
+        perf_counter = getattr(forward_batch, "oceandisk_perf_counter", None)
+        perf_start = (
+            perf_counter.perf_layer_start(self.layer_id)
+            if perf_counter is not None
+            else None
+        )
         hidden_states_orig = hidden_states
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -2520,6 +2526,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        if perf_counter is not None:
+            perf_counter.perf_layer_end(self.layer_id, perf_start)
 
         return hidden_states, residual, topk_indices
 
