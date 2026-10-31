@@ -174,15 +174,6 @@ class LayerWiseLoadCounter:
                 if threshold == self.num_layers - 1:
                     self._perf_waits.pop(index, None)
             if threshold == self.num_layers - 1:
-                for layer, total_ms in sorted(waits.items()):
-                    logger.info(
-                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
-                        index,
-                        layer,
-                        total_ms,
-                    )
-                self._perf_waits.pop(index, None)
-            if threshold == self.num_layers - 1:
                 self.futures.pop(index, None)
 
     def reset(self) -> None:
