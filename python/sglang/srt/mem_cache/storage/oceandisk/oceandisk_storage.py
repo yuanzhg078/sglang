@@ -12,8 +12,11 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
 from typing import TYPE_CHECKING
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
@@ -211,7 +214,7 @@ class OceanDiskStorage(HiCacheStorage):
         )
         self._closed = False
         self._debug_put_history = OrderedDict()
-        self._io_lock = threading.Lock()
+        self._put_io_lock = threading.Lock()
         self._task_ids = itertools.count(1)
 
         import torch
@@ -333,19 +336,42 @@ class OceanDiskStorage(HiCacheStorage):
                 registered_regions=len(self.regions),
             )
 
+        self._io_queue = Queue()
+        self._io_thread = threading.Thread(
+            target=self._io_worker, daemon=True, name="oceandisk-storage-io"
+        )
+        self._io_thread.start()
+
     def _run_io(self, operation, stream):
-        # Serialize native GET/PUT through GPU completion, including EXISTS
-        # under the same lock. Separate streams alone do not provide exclusion.
-        with (
-            self._io_lock,
-            self._torch.cuda.device(self.device),
-            self._torch.cuda.stream(stream),
-        ):
-            self._ensure_open()
+        self._ensure_open()
+        completion = Future()
+        self._io_queue.put((operation, stream, completion))
+        return completion.result()
+
+    def _io_worker(self):
+        while True:
+            task = self._io_queue.get()
             try:
-                return operation()
+                if task is None:
+                    return
+                operation, stream, completion = task
+                # EXISTS stays direct and excludes PUT submissions only.
+                io_lock = (
+                    self._put_io_lock if stream is self._put_stream else nullcontext()
+                )
+                try:
+                    with (
+                        io_lock,
+                        self._torch.cuda.device(self.device),
+                        self._torch.cuda.stream(stream),
+                    ):
+                        self._ensure_open()
+                        result = operation()
+                    completion.set_result(result)
+                except BaseException as error:
+                    completion.set_exception(error)
             finally:
-                stream.synchronize()
+                self._io_queue.task_done()
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -353,10 +379,10 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
-        # Exclude GET/PUT until the synchronous query returns.
+        # Exclude new PUT submissions until the synchronous query returns.
         with self._torch.cuda.device(self.device):
             started = time.perf_counter() if timings is not None else 0.0
-            with self._io_lock:
+            with self._put_io_lock:
                 if timings is not None:
                     timings["put_lock_ms"] = (time.perf_counter() - started) * 1000
                 self._ensure_open()
@@ -747,7 +773,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            # Wait before taking the I/O lock; do not hold up GET/EXISTS for compute.
+            # Wait before queuing PUT; do not hold up GET/EXISTS for compute.
             ready_event.synchronize()
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
@@ -830,8 +856,10 @@ class OceanDiskStorage(HiCacheStorage):
         if self._closed:
             return
         # Linker stops and joins its producers before closing Storage.
+        self._io_queue.put(None)
+        self._io_thread.join()
         with (
-            self._io_lock,
+            self._put_io_lock,
             self._torch.cuda.device(self.device),
         ):
             self._get_stream.synchronize()
