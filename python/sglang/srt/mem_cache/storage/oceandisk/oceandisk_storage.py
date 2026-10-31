@@ -12,7 +12,6 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -212,7 +211,7 @@ class OceanDiskStorage(HiCacheStorage):
         )
         self._closed = False
         self._debug_put_history = OrderedDict()
-        self._put_io_lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._task_ids = itertools.count(1)
 
         import torch
@@ -335,16 +334,18 @@ class OceanDiskStorage(HiCacheStorage):
             )
 
     def _run_io(self, operation, stream):
-        # Scheduler layer waits finish GET before the next lookup. Only
-        # background PUT needs exclusion against synchronous EXISTS.
-        io_lock = self._put_io_lock if stream is self._put_stream else nullcontext()
+        # Serialize native GET/PUT through GPU completion, including EXISTS
+        # under the same lock. Separate streams alone do not provide exclusion.
         with (
-            io_lock,
+            self._io_lock,
             self._torch.cuda.device(self.device),
             self._torch.cuda.stream(stream),
         ):
             self._ensure_open()
-            return operation()
+            try:
+                return operation()
+            finally:
+                stream.synchronize()
 
     @staticmethod
     def _check_status(status, operation: str) -> None:
@@ -352,10 +353,10 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
-        # Exclude new PUT submissions until the synchronous query returns.
+        # Exclude GET/PUT until the synchronous query returns.
         with self._torch.cuda.device(self.device):
             started = time.perf_counter() if timings is not None else 0.0
-            with self._put_io_lock:
+            with self._io_lock:
                 if timings is not None:
                     timings["put_lock_ms"] = (time.perf_counter() - started) * 1000
                 self._ensure_open()
@@ -746,7 +747,7 @@ class OceanDiskStorage(HiCacheStorage):
             torch.cuda.stream(self._put_stream),
         ):
             self._ensure_open()
-            # Wait before taking the PUT lock; do not hold up EXISTS for compute.
+            # Wait before taking the I/O lock; do not hold up GET/EXISTS for compute.
             ready_event.synchronize()
             for cpu, gpu, lengths, indices in prepared:
                 call_start = time.perf_counter()
@@ -830,7 +831,7 @@ class OceanDiskStorage(HiCacheStorage):
             return
         # Linker stops and joins its producers before closing Storage.
         with (
-            self._put_io_lock,
+            self._io_lock,
             self._torch.cuda.device(self.device),
         ):
             self._get_stream.synchronize()
