@@ -10,6 +10,7 @@ export USE_SINGLE_PORT="${USE_SINGLE_PORT:-0}"
 GPUS="${GPUS-0,1,2,3,4,5,6,7}"   # empty string -> single-GPU mode
 DEVICE="${DEVICE:-0}"            # used only without --gpus
 EXISTS_DEVICE="${EXISTS_DEVICE-}" # empty -> skip EXISTS; set 1 to query on GPU 1
+EXISTS_ON_WRITER="${EXISTS_ON_WRITER:-0}" # set 1 to also query on the PUT GPU
 SKIP_GET="${SKIP_GET:-0}"        # set 1 to run PUT and EXISTS only
 CONN="${CONN-}"                  # empty -> route each key to its DPU
 CONNS="${CONNS-}"                # empty -> all connections; e.g. 0,1,2
@@ -34,6 +35,9 @@ if [[ -n "${GPUS}" ]]; then
 fi
 if [[ -n "${EXISTS_DEVICE}" ]]; then
   args+=(--exists-device "${EXISTS_DEVICE}")
+fi
+if [[ "${EXISTS_ON_WRITER}" == "1" ]]; then
+  args+=(--exists-on-writer)
 fi
 if [[ "${SKIP_GET}" == "1" ]]; then
   args+=(--skip-get)
