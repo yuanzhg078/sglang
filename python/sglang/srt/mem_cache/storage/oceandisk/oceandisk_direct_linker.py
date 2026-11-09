@@ -610,6 +610,29 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         else:
             bitmap = self.storage.exists_many(keys)
             end = next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
+        if len(keys) * 2 < end * 5 < len(keys) * 4:
+            router = self.storage.connection_router
+            miss_key = keys[end]
+            hit_key = keys[end - 1] if end else None
+            logger.info(
+                "[OceanDisk LOOKUP MISS] rid=%s tp_rank=%d pages=%d "
+                "first_miss_page=%d first_miss_key=%d first_miss_dpu=%s "
+                "last_hit_key=%s last_hit_dpu=%s "
+                "next_pages_keys_dpus=%s pause_s=30",
+                rid,
+                get_tensor_model_parallel_rank(),
+                len(keys),
+                end + 1,
+                miss_key,
+                router.dpu_for_key(miss_key),
+                hit_key,
+                router.dpu_for_key(hit_key) if hit_key is not None else None,
+                [
+                    (page, key, router.dpu_for_key(key))
+                    for page, key in enumerate(keys[end + 1 : end + 4], start=end + 2)
+                ],
+            )
+            time.sleep(30)
         if debug_cache:
             cache_debug(
                 "LOOKUP",
@@ -619,7 +642,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 pending_offload_at_lookup=pending_at_lookup,
                 first_hash=kv.keys[0] if keys else None,
                 first_key=keys[0] if keys else None,
-                first_miss_key=keys[end] if end < len(keys) else None,
             )
         trace_event(
             "LOOKUP",
@@ -627,7 +649,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             pages=len(keys),
             prefix_pages=end,
             first_key=keys[0],
-            first_miss_key=keys[end] if end < len(keys) else None,
         )
         return end
 

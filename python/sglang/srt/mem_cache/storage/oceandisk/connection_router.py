@@ -39,8 +39,14 @@ class ConnectionRouter:
         self.next_connection = [0] * len(self.ring)
         self.lock = Lock()
 
+    def _ring_index(self, key):
+        return self._find_ring_index(key % (1 << 64)) % len(self.ring)
+
+    def dpu_for_key(self, key):
+        return self.ring[self._ring_index(key)][1]
+
     def select(self, key):
-        index = self._find_ring_index(key % (1 << 64)) % len(self.ring)
+        index = self._ring_index(key)
         connections = self.groups[self.ring[index][1]]
         with self.lock:
             connection = connections[self.next_connection[index] % len(connections)]
