@@ -355,9 +355,9 @@ def launch_multi_gpu(args):
     sync_dir = args.sync_dir or tempfile.mkdtemp(prefix="oceandisk-multigpu-")
     os.makedirs(sync_dir, exist_ok=True)
     for name in os.listdir(sync_dir):
-        if name in ("go", "go.tmp", "put_done", "exists_done") or name.startswith(
-            "ready_"
-        ):
+        if name in (
+            "go", "go.tmp", "put_done", "exists_done", "writer_exists_done"
+        ) or name.startswith("ready_"):
             os.remove(os.path.join(sync_dir, name))
     run_token = args.run_token or secrets.token_hex(8)
     base = strip_option(
@@ -460,6 +460,9 @@ def main():
     parser.add_argument(
         "--exists-device", type=int, help="GPU index that runs EXISTS after PUT"
     )
+    parser.add_argument(
+        "--exists-on-writer", action="store_true", help="also run EXISTS on the PUT GPU"
+    )
     parser.add_argument("--skip-get", action="store_true", help="run PUT and EXISTS only")
     parser.add_argument(
         "--split-first-layer",
@@ -512,6 +515,8 @@ def main():
         parser.error("--warmup must be >= 0 and --repeat must be > 0")
     if args.skip_get and args.exists_device is None:
         parser.error("--skip-get requires --exists-device")
+    if args.exists_on_writer and args.exists_device is None:
+        parser.error("--exists-on-writer requires --exists-device")
     if args.gpus and args.worker_index is None:
         if args.exists_device is not None and args.exists_device not in [
             int(part) for part in args.gpus.split(",") if part.strip()
@@ -700,7 +705,8 @@ def main():
                 wait_for_file(touch_tag, timeout=900)
 
         if args.exists_device is not None:
-            if args.device == args.exists_device:
+            is_query_device = args.device == args.exists_device
+            if is_query_device or (args.exists_on_writer and is_writer):
                 pools = (("kv", kv_keys, conns[:pages]),)
                 if args.separate_pool_keys:
                     pools += (("index", index_keys, conns[pages:]),)
@@ -747,10 +753,16 @@ def main():
                             f"retry_hit_pages={retry_hits}/{pages}",
                             flush=True,
                         )
-                if is_worker:
+                if is_worker and is_query_device:
                     touch_file(os.path.join(args.sync_dir, "exists_done"))
-            elif is_worker:
+                if is_worker and args.exists_on_writer and is_writer:
+                    touch_file(os.path.join(args.sync_dir, "writer_exists_done"))
+            if is_worker:
                 wait_for_file(os.path.join(args.sync_dir, "exists_done"), timeout=900)
+                if args.exists_on_writer:
+                    wait_for_file(
+                        os.path.join(args.sync_dir, "writer_exists_done"), timeout=900
+                    )
 
         if args.skip_get:
             if is_worker:
