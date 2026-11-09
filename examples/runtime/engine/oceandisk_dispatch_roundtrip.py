@@ -704,17 +704,25 @@ def main():
                 pools = (("kv", kv_keys, conns[:pages]),)
                 if args.separate_pool_keys:
                     pools += (("index", index_keys, conns[pages:]),)
-                for task, (pool, page_keys, page_conns) in enumerate(
-                    pools, start=1 + 2 * layers
-                ):
+                task = 1 + 2 * layers
+
+                def query_exists(query_keys, query_conns):
+                    nonlocal task
                     query = torch.tensor(
-                        [task, *page_keys, *page_conns], dtype=torch.int64, device=device
+                        [task, *query_keys, *query_conns],
+                        dtype=torch.int64,
+                        device=device,
                     )
-                    hits = torch.ops.my_ops.kvcache_exist(query, output)
-                    if not isinstance(hits, int) or not 0 <= hits <= pages:
+                    task += 1
+                    result = torch.ops.my_ops.kvcache_exist(query, output)
+                    if not isinstance(result, int) or not 0 <= result <= len(query_keys):
                         raise RuntimeError(
-                            f"kvcache_exist returned invalid prefix: {hits!r}"
+                            f"kvcache_exist returned invalid prefix: {result!r}"
                         )
+                    return result
+
+                for pool, page_keys, page_conns in pools:
+                    hits = query_exists(page_keys, page_conns)
                     message = (
                         f"EXISTS: device={args.device} pool={pool} "
                         f"hit_pages={hits}/{pages}"
@@ -728,6 +736,17 @@ def main():
                             f" last_hit_key={last_key} last_hit_dpu={last_dpu}"
                         )
                     print(message, flush=True)
+                    if hits < pages:
+                        miss_key, miss_conn = page_keys[hits], page_conns[hits]
+                        single_hit = query_exists([miss_key], [miss_conn])
+                        retry_hits = query_exists(page_keys, page_conns)
+                        print(
+                            f"EXISTS RECHECK: device={args.device} pool={pool} "
+                            f"key={miss_key} conn={miss_conn} "
+                            f"dpu={conn_to_dpu[miss_conn]} single_hit={single_hit} "
+                            f"retry_hit_pages={retry_hits}/{pages}",
+                            flush=True,
+                        )
                 if is_worker:
                     touch_file(os.path.join(args.sync_dir, "exists_done"))
             elif is_worker:
