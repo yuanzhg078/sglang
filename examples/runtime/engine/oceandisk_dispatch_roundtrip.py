@@ -692,6 +692,8 @@ def main():
                 [torch.cuda.Event() for _ in range(layers)],
                 stream,
             )
+            print("PUT: waiting 15 seconds after completion", flush=True)
+            time.sleep(15)
         elif is_worker:
             print("PUT: skipped (pure reader; worker 0 is the writer)")
             if is_worker:
@@ -743,6 +745,14 @@ def main():
                         )
                     print(message, flush=True)
                     if hits < pages:
+                        for index in range(hits, min(hits + 6, pages)):
+                            conn = page_conns[index]
+                            print(
+                                f"EXISTS MISS WINDOW: device={args.device} pool={pool} "
+                                f"page={index + 1} key={page_keys[index]} "
+                                f"conn={conn} dpu={conn_to_dpu[conn]}",
+                                flush=True,
+                            )
                         miss_key, miss_conn = page_keys[hits], page_conns[hits]
                         single_hit = query_exists([miss_key], [miss_conn])
                         retry_hits = query_exists(page_keys, page_conns)
