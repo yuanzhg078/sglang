@@ -134,14 +134,16 @@ def load_connection_selector(config_path, selected=None):
         from xxhash import xxh3_64_hexdigest
 
     groups = {}
+    conn_to_dpu = {}
     available = 0
     for raw in config_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or not line.startswith("ip_config"):
             continue
+        fields = [part.strip() for part in line.split("=", 1)[1].split(",")]
+        dpu = int(fields[5])
+        conn_to_dpu[available] = dpu
         if selected is None or available in selected:
-            fields = [part.strip() for part in line.split("=", 1)[1].split(",")]
-            dpu = int(fields[5])
             groups.setdefault(dpu, []).append(available)
         available += 1
     if not groups:
@@ -163,7 +165,7 @@ def load_connection_selector(config_path, selected=None):
         cursors[slot] += 1
         return connection
 
-    return select, available, sorted(groups)
+    return select, available, sorted(groups), conn_to_dpu
 
 
 def report_routing(label, rows):
@@ -353,7 +355,9 @@ def launch_multi_gpu(args):
     sync_dir = args.sync_dir or tempfile.mkdtemp(prefix="oceandisk-multigpu-")
     os.makedirs(sync_dir, exist_ok=True)
     for name in os.listdir(sync_dir):
-        if name in ("go", "go.tmp", "put_done") or name.startswith("ready_"):
+        if name in ("go", "go.tmp", "put_done", "exists_done") or name.startswith(
+            "ready_"
+        ):
             os.remove(os.path.join(sync_dir, name))
     run_token = args.run_token or secrets.token_hex(8)
     base = strip_option(
@@ -398,16 +402,17 @@ def launch_multi_gpu(args):
         wait_for_file(os.path.join(sync_dir, "put_done"), 900, processes)
         for index in range(len(gpus)):
             wait_for_file(os.path.join(sync_dir, f"ready_{index}"), 900, processes)
-        target_ns = time.time_ns() + 200_000_000
-        # Publish atomically: a plain open+write exposes an empty file first.
-        go_path = os.path.join(sync_dir, "go")
-        temp_path = go_path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            handle.write(str(target_ns))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, go_path)
-        print(f"multi-gpu: all ready, GET base_ns={target_ns} (+200ms)")
+        if not args.skip_get:
+            target_ns = time.time_ns() + 200_000_000
+            # Publish atomically: a plain open+write exposes an empty file first.
+            go_path = os.path.join(sync_dir, "go")
+            temp_path = go_path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                handle.write(str(target_ns))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, go_path)
+            print(f"multi-gpu: all ready, GET base_ns={target_ns} (+200ms)")
         for process in processes:
             code = process.wait()
             if code:
@@ -452,6 +457,10 @@ def main():
     parser.add_argument("--kv-bytes", type=int, default=4096)
     parser.add_argument("--index-bytes", type=int, default=4096)
     parser.add_argument("--separate-pool-keys", action="store_true")
+    parser.add_argument(
+        "--exists-device", type=int, help="GPU index that runs EXISTS after PUT"
+    )
+    parser.add_argument("--skip-get", action="store_true", help="run PUT and EXISTS only")
     parser.add_argument(
         "--split-first-layer",
         action=argparse.BooleanOptionalAction,
@@ -501,9 +510,17 @@ def main():
         parser.error("layers, pages and pool sizes must be positive")
     if args.warmup < 0 or args.repeat <= 0:
         parser.error("--warmup must be >= 0 and --repeat must be > 0")
+    if args.skip_get and args.exists_device is None:
+        parser.error("--skip-get requires --exists-device")
     if args.gpus and args.worker_index is None:
+        if args.exists_device is not None and args.exists_device not in [
+            int(part) for part in args.gpus.split(",") if part.strip()
+        ]:
+            parser.error("--exists-device must be included in --gpus")
         return launch_multi_gpu(args)
     is_worker = args.worker_index is not None
+    if not is_worker and args.exists_device not in (None, args.device):
+        parser.error("--exists-device must match --device without --gpus")
     is_writer = not is_worker or args.worker_index == 0
     if is_worker and not args.sync_dir:
         parser.error("--sync-dir is set by the --gpus launcher")
@@ -539,7 +556,9 @@ def main():
     )
     if selected is not None and (not selected or len(set(selected)) != len(selected)):
         parser.error("--conns must list distinct connection indices")
-    select_conn, available, dpu_ids = load_connection_selector(config_path, selected)
+    select_conn, available, dpu_ids, conn_to_dpu = load_connection_selector(
+        config_path, selected
+    )
     if args.conn is not None and not 0 <= args.conn < available:
         parser.error(f"--conn must be in [0, {available}) from {config_path}")
 
@@ -549,9 +568,14 @@ def main():
     import od_utils
 
     pure_reader = is_worker and not is_writer
-    regions = 1 if pure_reader else 2
+    regions = 1 if pure_reader or args.skip_get else 2
     buffers = [
-        torch.full((regions * payload + 512,), 0xA5, device=device, dtype=torch.uint8)
+        torch.full(
+            (512 if pure_reader and args.skip_get else regions * payload + 512,),
+            0xA5,
+            device=device,
+            dtype=torch.uint8,
+        )
         for payload in payloads
     ]
     if not pure_reader:
@@ -625,15 +649,11 @@ def main():
         return torch.tensor(rows, dtype=torch.int64)
 
     with torch.cuda.stream(stream):
-        put_cpu = metadata(False, 1)
-        get_cpu = metadata(True, 1 + layers)
-        report_routing("PUT", put_cpu)
-        report_routing("GET", get_cpu)
-        put_gpu, get_gpu = put_cpu.to(device), get_cpu.to(device)
-        width = put_cpu.shape[1]
-        lengths = torch.full((layers,), width, dtype=torch.int64)
-        indices = torch.arange(layers, dtype=torch.int64)
-        tail = (stream.stream_id, args.device, 0, layers, True, False)
+        if not args.skip_get:
+            get_cpu = metadata(True, 1 + layers)
+            report_routing("GET", get_cpu)
+            get_gpu = get_cpu.to(device)
+            width = get_cpu.shape[1]
 
         def submit_span(first, last, event_handles):
             # Local slices plus start_layer=0: native indexes CPU task IDs and
@@ -653,6 +673,12 @@ def main():
             )
 
         if is_writer:
+            put_cpu = metadata(False, 1)
+            report_routing("PUT", put_cpu)
+            put_gpu = put_cpu.to(device)
+            lengths = torch.full((layers,), put_cpu.shape[1], dtype=torch.int64)
+            indices = torch.arange(layers, dtype=torch.int64)
+            tail = (stream.stream_id, args.device, 0, layers, True, False)
             dispatch(
                 "PUT",
                 lambda events: od_utils.batch_dispatch_put(
@@ -672,6 +698,45 @@ def main():
                 touch_file(touch_tag)
             else:
                 wait_for_file(touch_tag, timeout=900)
+
+        if args.exists_device is not None:
+            if args.device == args.exists_device:
+                pools = (("kv", kv_keys, conns[:pages]),)
+                if args.separate_pool_keys:
+                    pools += (("index", index_keys, conns[pages:]),)
+                for task, (pool, page_keys, page_conns) in enumerate(
+                    pools, start=1 + 2 * layers
+                ):
+                    query = torch.tensor(
+                        [task, *page_keys, *page_conns], dtype=torch.int64, device=device
+                    )
+                    hits = torch.ops.my_ops.kvcache_exist(query, output)
+                    if not isinstance(hits, int) or not 0 <= hits <= pages:
+                        raise RuntimeError(
+                            f"kvcache_exist returned invalid prefix: {hits!r}"
+                        )
+                    message = (
+                        f"EXISTS: device={args.device} pool={pool} "
+                        f"hit_pages={hits}/{pages}"
+                    )
+                    if hits < pages:
+                        last_key = page_keys[hits - 1] if hits else None
+                        last_dpu = conn_to_dpu[page_conns[hits - 1]] if hits else None
+                        message += (
+                            f" first_miss_page={hits + 1} first_miss_key={page_keys[hits]}"
+                            f" first_miss_dpu={conn_to_dpu[page_conns[hits]]}"
+                            f" last_hit_key={last_key} last_hit_dpu={last_dpu}"
+                        )
+                    print(message, flush=True)
+                if is_worker:
+                    touch_file(os.path.join(args.sync_dir, "exists_done"))
+            elif is_worker:
+                wait_for_file(os.path.join(args.sync_dir, "exists_done"), timeout=900)
+
+        if args.skip_get:
+            if is_worker:
+                touch_file(os.path.join(args.sync_dir, f"ready_{args.worker_index}"))
+            return
 
         def run_get(quiet, start_wait=None):
             events = [torch.cuda.Event() for _ in range(layers)]
