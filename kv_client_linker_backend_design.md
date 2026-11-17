@@ -1021,15 +1021,16 @@ BackupKV 是树侧的“保存/确认外部副本”指令。当前逐层模式�
 sequenceDiagram
     participant W as 调用侧 Wrapper
     participant D as KvClientDirectLinker
+    participant Q as offload_queue
     participant B as Offload worker
     participant S as KvClientStorage
     W->>D: offload(transfers)
     D->>D: resolve_transfers 展开 KV / Indexer
     D->>D: 在生产 stream 记录 ready event
-    D->>D: offload_queue.put(OFFLOAD, transfers, event)
+    D->>Q: put(OFFLOAD, transfers, ready_event)
     D-->>W: True，仅表示接受任务
-    B->>D: offload_queue.get()
-    D-->>B: OFFLOAD 任务
+    B->>Q: get()
+    Q-->>B: OFFLOAD、transfers、ready_event
     B->>B: 设置设备，等待 ready event 完成
     B->>B: 根据源 slots 解析全部必要层 ranges
     B->>S: put_async(全部层 KV / Indexer ranges)
@@ -1051,6 +1052,8 @@ offload(transfers)
 ```
 
 这里一次 StoreAsync 包含所有必要层，KvClient 内部按路由和协议限制拆分，向上仍返回一个 TaskId。任务规模必须满足 SDK 限制；超限应在规划阶段处理，不能丢条目。
+
+offload_queue 由 KvClientDirectLinker 持有，但队列本身不是线程：调用侧执行 put，独立 offload worker 执行 get 和后续 IO。
 
 普通卸载使用已有来源 slots，不新分配目标 slots，返回 True 时也不释放来源 slots。ready event 确认来源数据可读，Wait 确认保存完成；已提交后的失败需确认 IO 安全结束，超时未静默时保留保护并进入故障处理。
 
