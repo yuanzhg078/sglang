@@ -83,6 +83,43 @@ flowchart TB
 
 ### 对象持有与类继承关系
 
+先用文本区分持有关系和继承关系，不能把所有类理解成一条继承链。以下展示选用 KvClient 后端时的拟接入关系：
+
+```text
+UnifiedRadixCache
+  └─ 持有 UnifiedCacheLinkerWrapper（cache.linker）
+       ├─ 引用 cache：操作同一棵缓存树、节点和锁
+       └─ 持有 cache_linker：接口类型为 UnifiedCacheLinker
+            └─ 实际对象为 KvClientDirectLinker
+
+继承关系：
+UnifiedCacheLinker（ABC，传输接口）
+  └─ KvClientDirectLinker（拟新增的 KvClient 后端实现）
+
+KvClientDirectLinker
+  ├─ 持有 DevicePoolGroup
+  │    └─ 包含 DevicePoolEntry：引用已有 GPU buffers，描述地址和布局映射
+  └─ 持有 KvClientStorage：内存注册、IO 参数组装、任务跟踪和结果校验
+       └─ 持有 _kvclient.Client（C++ 包装类 PyClient 暴露的 Python 对象）
+            └─ 通过 unique_ptr 持有 kv::KvClient 的实现对象
+```
+
+接入缓存树时，复用已有 Wrapper 挂接方式：
+
+```python
+# UnifiedRadixCache.init_cache_linker()
+self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+```
+
+因此，启用拟新增的 KvClient 后端后：
+
+```python
+cache.linker               # 树侧 UnifiedCacheLinkerWrapper
+cache.linker.cache_linker  # KvClientDirectLinker 实例
+```
+
+KvClientDirectLinker 与 OceanDiskDirectLinker 是实现同一传输接口的不同后端；本方案不要求继承 OceanDiskDirectLinker。第一版不包含 PD 交接能力，也不引入 KvClient 的 PD 子类。KvClientStorage 与 PyClient 是被持有的协作对象，不是 Linker 的父类；PyClient 也不继承 SDK 的 kv::KvClient。
+
 | 关系 | 图中符号 | 含义 |
 | --- | --- | --- |
 | 泛化 | 实线与空心三角 | 子类继承父类，三角指向父类 |
@@ -264,6 +301,49 @@ flowchart LR
 
 ### 2.3 存储接口与参数约定
 
+**KvClientStorage 不只是转发 SDK 调用，它负责内存注册记录、IO 参数组装、原生任务跟踪和结果校验。** 它将 DirectLinker 给出的传输范围转换成可提交给 SDK 的请求，并管理这些请求涉及的资源。
+
+| 职责 | 第一版拟实现行为 |
+| --- | --- |
+| 客户端初始化 | 根据配置路径和设备编号创建 `_kvclient.Client`，由绑定层创建并初始化 SDK 客户端 |
+| 内存注册与登记 | 接收去重后的底层 allocation 区间，调用注册接口，校验返回结果，保存 region、handle、tokenId 及来源关系 |
+| IO 参数组装 | 接收 key、addr、size、device_id、remote_offset，检查地址范围完全落在已注册区间内，查找对应 handle 并构造绑定输入 |
+| 查询适配 | 通过 `query_async → wait` 获取并校验对象查询结果，提供给 Linker 判断连续可恢复前缀 |
+| 异步任务跟踪 | 提交 GET/PUT 后登记有效 TaskId 及相关资源，避免任务丢失或结果重复消费 |
+| 完成结果校验 | 检查等待状态、任务状态和逐条结果，保留失败信息，不将“提交成功”当成“传输成功” |
+| 资源关闭 | 停止接受新任务，排空活动 IO；确认安全结束后再注销内存和关闭客户端 |
+
+各层分工如下：
+
+| 对象 | 负责 | 交给下一层的内容 |
+| --- | --- | --- |
+| KvClientDirectLinker，借助 DevicePoolEntry | 组织页和层的传输，解析 slot 对应的地址、长度，确定页 key 与远端 offset，管理线程和层门控 | 本次 IO 的 ranges |
+| KvClientStorage | 查注册记录、填 handle、组装请求、跟踪 TaskId、校验结果 | SDK 绑定接受的 entries |
+| `_kvclient.Client` / PyClient | 检查绑定参数类型和范围，转换 Python/C++ 类型，调用 SDK，转换返回结果 | SDK 原生结构和方法调用 |
+| `kv::KvClient` | 执行路由、传输和原生任务管理 | 原生任务结果 |
+
+Storage 不操作缓存树、不挑选空闲 slots，也不根据模型布局计算 slot 的物理地址。页 key 和统一远端 offset 由 Linker 侧确定；Storage 根据实际本地地址查找注册 handle，而不是仅凭 KV/Indexer 池名选择 handle。
+
+以一次读取为例：
+
+```text
+DirectLinker 解析本层两池的 ranges
+  → 每段包含 key8、addr、size、device_id、remote_offset
+KvClientStorage.get_async(ranges)
+  → 查找完全覆盖每个本地子区间的注册记录
+  → 填入对应 handle，构造 entries
+  → 调用 _kvclient.Client.load_async(entries)
+  → 成功后登记 TaskId 和相关资源，并返回 TaskId
+后台加载线程调用 KvClientStorage.wait(task_id)
+  → 经绑定调用 SDK Wait
+  → 校验等待、任务和逐条状态，消费此次结果
+  → 将结果交给 Linker，由 Linker 决定层门控和完成通知
+```
+
+提交失败时没有有效 TaskId，应抛出异常而不是登记一个占位任务。Wait 超时不代表 IO 已停止，不能据此释放 GPU slots 或注销内存；未能确认 IO 静默时须保留相关资源并进入故障处理，具体规则见第 11 节。
+
+下面的代码仅展示接口形状，实际实现还需补齐上述注册检查、活动任务记录和异常处理。
+
 ```python
 # kvclient_storage.py，拟实现用法
 import _kvclient
@@ -301,31 +381,129 @@ EXISTS 图展示存储接口与 SDK 调用两层；GET/PUT 图将绑定和 SDK �
 
 ## 3. 初始化：先初始化客户端，再注册设备内存
 
+初始化包含后端自身初始化和缓存树挂接两部分。下图完整展示拟接入顺序：先构造 KvClientDirectLinker，完成客户端初始化、内存注册和后台执行准备，再通过 `cache.init_cache_linker(linker)` 创建公共 Wrapper。Wrapper 不是由 Storage 或 SDK 创建的。
+
+图例（KvClient 后端对象及线程为拟实现关系）：
+
+| 图中名称 | 实际对象或执行位置 |
+| --- | --- |
+| registry | `registry.py` 中的初始化调用侧 |
+| Cache / cache | `UnifiedRadixCache` 实例 |
+| Wrapper / wrapper | `cache.linker`，即 `UnifiedCacheLinkerWrapper` 实例 |
+| linker / DirectLinker | `cache.linker.cache_linker`，即 `KvClientDirectLinker` 实例 |
+| assembler | 公共设备布局工具模块 `hybrid_cache/linker_pool_assembler.py` |
+| PoolGroup | `linker.pool_group`，即 `DevicePoolGroup`；包含 KV / Indexer Entries |
+| Storage / PyClient | `linker.storage`（`KvClientStorage`）及其 `client`（`_kvclient.Client`）；图中合并展示两层 |
+| KvClient SDK | PyClient 内部持有的 `kv::KvClient` 实现对象 |
+| component | Cache 中的 FULL 等树组件；分配工作使用已有 allocator |
+| counter | `linker.layer_done_counter`；设备 KV pool 和 TP worker 接入同一个对象 |
+| load thread | 拟由 `linker._load_thread` 执行同一后端对象的 `_load_worker()`，不是另一份 linker |
+| pool / kvcache | 模型实际使用的 GPU KV pool，持有数据 buffers；不是 `DevicePoolGroup` |
+
 ```mermaid
 sequenceDiagram
     participant R as registry
-    participant B as KvClientDirectLinker
-    participant P as DevicePoolGroup
-    participant N as KvClientStorage / _kvclient.Client
-    participant K as kv::KvClient
+    participant C as Cache
+    participant W as Wrapper
+    participant B as linker<br/>KvClientDirectLinker
+    participant A as assembler
+    participant P as PoolGroup
+    participant N as Storage / PyClient
+    participant K as KvClient SDK
+    R->>C: 创建缓存树和 components
     R->>B: 构造后端
-    B->>P: 解析设备 pool 和支持的布局
+    B->>A: resolve_hybrid_device_pool_group(<br/>kvcache, page_size,<br/>params, components)
+    A-->>B: Group + KV / Indexer Entries
+    B->>B: 保存 pool_group、entry_map，校验支持的布局
     B->>N: 配置文件、当前设备编号
     N->>N: KvClientConfig::LoadFromFile
     N->>N: CreateKvClient
     N->>K: Init(config)
-    B->>P: 分别枚举 KV 与 Indexer 的底层 allocations，去重
+    B->>P: 枚举两池 allocations 并去重
     P-->>B: KV regions 与 Indexer regions
-    B->>N: register_buffers(KV regions, Indexer regions)
-    N->>K: 一次调用 RegisterRegions(KV regions + Indexer regions, registered)
+    B->>N: register_buffers(regions)
+    N->>K: RegisterRegions(<br/>regions, registered)
     K-->>N: KV 注册项：region、handle、tokenId
     K-->>N: Indexer 注册项：region、handle、tokenId
     N->>N: 按实际 allocation 缓存两池注册记录
     B->>B: 创建队列、层计数器及加载/卸载线程
-    R->>R: 将 layer_done_counter 注册到设备 KV pool 和 TP worker
+    R->>C: init_cache_linker(linker)
+    C->>W: 创建 Wrapper(cache=C, cache_linker=B)
+    W->>W: 保存 cache 和后端引用
+    W-->>C: 返回 Wrapper 实例
+    C->>C: self.linker = Wrapper 实例
+    R->>W: 读取 layer_done_counter
+    W->>B: 读取后端 layer_done_counter
+    B-->>W: counter
+    W-->>R: counter
+    R->>R: 注册 counter 到 pool / TP worker
+    R->>R: 启用时接通逐层保存入口
 ```
 
+对应的拟接入代码如下，仅展示关键关系，具体构造参数和 guards 仍需在 registry 中实现：
+
+```python
+linker = KvClientDirectLinker(...)
+cache.init_cache_linker(linker)
+
+# init_cache_linker 内部复用已有实现：
+# self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+counter = cache.linker.layer_done_counter
+kvcache.register_layer_transfer_counter(counter)
+tp_worker.register_hicache_layer_transfer_counter(counter)
+if linker.layerwise_save_enabled:
+    tp_worker.layerwise_cache_linker = cache.linker
+```
+
+初始化结束后的调用入口是 `cache.linker`（Wrapper），实际后端是 `cache.linker.cache_linker`（KvClientDirectLinker）。Wrapper 引用原有 cache，不复制缓存树；它负责树侧保护与收尾，后端负责传输。只完成后端构造还不算接入完成，必须挂接 Wrapper 并接通层计数器及启用的保存 hook。
+
+后端构造函数内部拟复用的设备布局入口是 `hybrid_cache/linker_pool_assembler.py` 中已有的 `resolve_hybrid_device_pool_group()`，调用形状如下：
+
+```python
+self.pool_group = resolve_hybrid_device_pool_group(
+    kvcache=params.token_to_kv_pool_allocator.get_kvcache(),
+    page_size=params.page_size,
+    params=params,
+    components=components,
+)
+self.pools = self.pool_group.entry_map
+self.num_layers = self.pool_group.num_layers
+```
+
+对于本方案支持的 DSA 路径，该入口内部使用 `_build_dsa_device_pool_group()`，返回包含 KV / Indexer Entries 的 DevicePoolGroup；两个 Entry 分别引用已有的 `kv_buffer` 和 `index_k_with_scale_buffer`。该函数建立已有设备内存的布局视图，不执行 SDK 内存注册，也不提交 IO。KvClient 后端还需明确拒绝第一版不支持的 MTP draft 等配置。
+
 注册的是完整 allocation；每次 IO 可以只访问其中一个子区间。设备/provider 支持范围和地址对齐必须在接入设备上验证，不能假定所有 CUDA/NPU buffer 都能直连。
+
+### KvClientDirectLinker 在什么时候接到 Cache 上？
+
+拟在创建缓存树的初始化阶段，由 `registry.py` 按配置选择 `KvClientDirectLinker`，创建实例，再调用 `cache.init_cache_linker(linker)`。省略其他分支后的等价示意代码如下；KvClient 后端选择分支及构造函数仍待实现：
+
+```python
+cache = UnifiedRadixCache(params)
+linker_cls = KvClientDirectLinker  # 拟新增：backend 配置为 kvclient
+linker = linker_cls(server_args, params, components=set(cache.components))
+cache.init_cache_linker(linker)
+```
+
+已有 `init_cache_linker()` 内部的关键操作是：
+
+```python
+self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+```
+
+执行后的对象关系是：
+
+```text
+cache
+  └─ linker → Wrapper
+                 ├─ cache → 原来的 cache
+                 └─ cache_linker → 刚创建的 KvClientDirectLinker 实例
+```
+
+因此，这里“注册 KvClient 后端”指选择类、创建对象，再通过 Wrapper 保存引用；本方案不引入单独的 `register_kvclient_linker()` 挂接接口。Wrapper 与后端引用的是原有缓存树和设备数据，不创建另一棵树或另一份 GPU 缓存。
+
+**最后的 counter 注册是另一件事。** registry 通过 Wrapper 取出这个后端对象的 `layer_done_counter`，注册给设备 KV pool 和 TP worker，把模型执行侧的逐层等待机制接通。它不是再次创建或挂接后端对象，也不会在初始化时直接执行 GET。设备内存注册则是把 GPU allocation 地址范围交给 SDK，和对象挂接、counter 注册也应分别理解。
 
 ### 3.1 实例归属：每个推理 worker/rank 一个客户端
 
@@ -406,6 +584,58 @@ RegisterRegions 可以一次接收两池的 regions，返回逐项 RegisteredMem
 调用者保存注册返回的 tokenId，但不自行填充 KVBuffer.mrKey；KvClient 提交时按 handle 查注册表解析。handle/tokenId 是注册 API 返回的标识，不应自行生成或假设二者相等。
 
 ## 4. 数据如何变成 KVBuffer
+
+### 逻辑任务、slot 与物理地址
+
+**PoolTransfer 是逻辑任务单，不包含算好的 GPU 地址。** 下面是示意值，实际 `device_indices` 使用 tensor：
+
+```python
+PoolTransfer(
+    name=PoolName.KV,
+    keys=["A", "B"],
+    device_indices=slots_tensor,
+)
+# slots_tensor = [128,129,130,131, 256,257,258,259]
+# page_size = 4：A 对应前四个 slots，B 对应后四个 slots。
+```
+
+`keys` 定位外部存储中的逻辑页，`device_indices` 定位本地设备缓存中的 token slots。GET 将对应页读入这些 slots，PUT 将这些 slots 的数据写出。查询阶段没有目标 slots 也正常，因为查询只关心对象是否存在。
+
+slot 是设备内存池中的位置编号，分配器管理其使用权；它不是指针，也不是新分配的一份 CUDA tensor。GPU KV 分配器属于 SGLang 内存管理，正常计算也使用它。Wrapper 通过 cache、components 和已有 allocator 协调目标位置，KvClient 后端不自行挑选空闲 slots。
+
+**原有 kvcache 已经持有 GPU buffers；DevicePoolEntry 引用这些已有 tensor，不复制或另建一份数据显存。** 初始化 linker 时，assembler 创建 Entry，Entry 从 buffer 读取起始地址、行步长和片段长度等元数据；DevicePoolGroup 再建立 `name → Entry` 的查找表。客户端初始化后注册这些 buffers 的底层 allocations，后续 IO 使用其中的子区间。
+
+```text
+原有 kvcache
+  ├─ kv_buffer                 ← KV Entry 引用
+  └─ index_k_with_scale_buffer  ← Indexer Entry 引用
+                                  ↑
+DevicePoolGroup 按 name 组织这两个 Entry
+```
+
+`resolve_transfers()` 根据各 Entry 的 `indices_from_pool` 查找输入任务，将逻辑任务展开成物理池任务。DSA 的 KV 与 Indexer Entry 均从逻辑 KV 任务取索引；输出任务的 `name` 分别为 KV、INDEXER。函数将 `entry.translate_indices(source.device_indices)` 填入输出任务的 `host_indices`，同时保留 `device_indices`。没有配置 index mapper 时，索引数值原样保留。
+
+这里复用了通用传输接口的 `host_indices` 字段：**在 device 直连路径中，它表示目标物理 device pool 使用的索引，不是 CPU host cache 位置，也不是外部存储的 slot。** `resolve_transfers()` 只组织任务和按需映射索引，不搬数据，也尚未计算最终 GPU 地址。
+
+### DSA 的 token 行与 page 行如何对应
+
+两池都按逻辑页传输，但 GPU buffer 的一行不一定是一页。假设页起始 token slot 为 128，`page_size=4`：
+
+| 物理池 | Entry 设置 | 该页对应的 buffer 行 |
+| --- | --- | --- |
+| KV | `rows_are_pages=False` | 从第 128 行开始，覆盖连续 4 个 token 行 |
+| Indexer | `rows_are_pages=True` | 第 32 行，即 `128 / 4`；一行存一页 Indexer 数据 |
+
+Entry 后续通过 `prepare_locations(indices)` 校验按页对齐、页内连续的索引，并换算行号；再通过 `get_prepared_layer_range_meta(locations, layer)` 结合具体层的 buffer 元数据计算地址、长度和片段偏移。
+
+```text
+KV 地址      = 该层 KV base      + 128 × KV token 行步长
+Indexer 地址 = 该层 Indexer base +  32 × Indexer page 行步长
+```
+
+因此，同一组 token slot 索引在不同层、不同池对应不同地址，必须结合 Entry 的布局寻址。上述转换只计算位置，不搬数据；实际 IO 在后续提交 KvClient 任务时执行。
+
+Mooncake 和 OD 在相同 DSA 路径也使用同一个设备 pool assembler。两种行布局由已有 GPU buffers 决定，不是 OD 或 KvClient 协议独有的规则；其他模型须按实际设备 pool strategy 判断。
 
 ### 4.1 DSA 一页一个 key，两池和各层用远端 offset 区分
 
@@ -524,15 +754,71 @@ TP=4 且每卡一个 worker 时，每个 rank 都有一个 linker、一组包含
 
 跨 rank 的可恢复边界仍由 Wrapper 求交集。验收需同时检查两池逐字节一致，以及 owner/非 owner 的 offload 完成顺序不破坏 pending_offloads 对应关系。
 
+## 调度总览：先匹配，再接纳，最后统一启动
+
+EXISTS 与 GET 不是同一次调用。前缀匹配阶段先查出外部可恢复范围，Wrapper 保存外部 hit marker；调度器接纳请求、实际需要恢复时，再使用这个标记准备加载。下面以候选请求 A、B 为例串起公共调度路径；KvClient 调用部分为拟接入行为：
+
+```text
+调度器遍历候选请求 A
+  │
+  ├─ ① req.init_next_round_input(cache)
+  │      → cache.match_prefix(...)
+  │          → 匹配本地 GPU 缓存树
+  │          → wrapper.match(...)
+  │              → linker.lookup(...)：查询 KvClient 外部缓存
+  │              → 若可恢复，记录请求的外部 hit marker
+  │      → 将前缀匹配结果写回 req
+  │
+  └─ ② adder.add_one_req(A, ...)
+         → 检查接纳条件、资源和本轮预算
+         → 在需要且允许恢复外部缓存的路径上：
+             cache.init_load_back(...)
+               → wrapper.load_back(req)：使用此前的 hit marker
+                   → 协调 slots、更新树、保护节点
+                   → linker.load(rid, transfers)
+                       → 暂存到 linker.pending_loads，尚未 GET
+
+继续处理候选请求 B……
+
+③ 选择循环结束，有可运行请求时创建 new_batch
+   → 在 prepare_for_extend() 之前：
+       cache.ready_to_load_host_cache()
+         → wrapper.start_layer_wise_loading()
+             → linker.start_layer_wise_loading()
+                 → 将当前已收集的加载任务交给后台，启动 GET
+   → 返回的 counter index 保存到 batch，供本轮模型前向等待
+```
+
+**hit marker 表示“外部哪些页可恢复”，不是“数据已经在 GPU 上”。** 查到命中也不等于本轮一定接纳；请求准备和实际 GET 分开，才能先判断预算与接纳条件，再统一启动本轮已暂存任务。`load()` 返回只表示接受任务，设备数据是否可用由后续逐层 counter 保证。
+
+讲解时可对照 `managers/scheduler.py` 的 `req.init_next_round_input(...)`、`adder.add_one_req(...)` 与 `ready_to_load_host_cache()` 调用，以及 `managers/schedule_policy.py` 的请求接纳逻辑。这里沿用的 host 命名是已有调度接口，不表示 KvClient 直连路径增加了 CPU host cache。
+
 ## 5. EXISTS：从前缀匹配到外部命中
+
+本章对应前面调度总览的第 ① 步中“查询外部缓存”的部分。`req.init_next_round_input(cache)` 调用 `cache.match_prefix(...)`，先匹配本地 GPU 缓存树，再由 `wrapper.match(...)` 组织外部查询。不是整个前缀匹配都叫 EXISTS：本地树匹配由 Cache 完成，外部对象查询才经 Linker 和 Storage 进入 KvClient 的 Query 接口。
+
+```text
+req.init_next_round_input(cache)
+  → cache.match_prefix(...)：匹配本地设备前缀
+    → wrapper.match(...)：组织外部查询
+      → linker.lookup(rid, transfers)
+        → storage.exists_many(keys)
+          → _kvclient.Client.query_async(...) → SDK QueryAsync
+          → _kvclient.Client.wait(...)        → SDK Wait
+```
+
+查询只需要页 keys，不需要加载目标 slots。外部结果经 Linker 转成连续可恢复页边界，Wrapper 协调各 rank 的共同边界并保存 hit marker，前缀匹配结果再写回请求。后面的 `adder.add_one_req()` 判断接纳条件，需要恢复时才使用该标记调用 `load_back()`；统一启动加载后才真正 GET。
 
 ```mermaid
 sequenceDiagram
-    participant W as Cache / Wrapper
-    participant B as KvClientDirectLinker
+    participant C as cache
+    participant W as wrapper
+    participant B as linker<br/>KvClientDirectLinker
     participant S as KvClientStorage
     participant K as kv::KvClient 经 _kvclient.Client
-    W->>W: 匹配设备前缀，生成缺失完整页的 hashes
+    C->>C: match_prefix(...)<br/>匹配本地设备前缀
+    C->>W: match(...)<br/>传入本地匹配结果
+    W->>W: 组织外部查询页 hashes
     W->>B: lookup(rid, transfers)
     B->>B: 每页生成一个 CacheKey
     B->>S: exists_many(keys)
@@ -545,6 +831,7 @@ sequenceDiagram
     B->>B: 计算连续可恢复页边界
     B-->>W: 例如 exists=[1,1,0] 返回 [1,2]
     W->>W: 跨 rank 求共同边界，保存 hit marker
+    W-->>C: 外部匹配结果<br/>随后写回请求
 ```
 
 EXISTS 此时只查询可恢复范围，不分配目标 slot，也不读取 KV。GET 阶段才使用 hit marker 组织恢复。
@@ -566,10 +853,11 @@ sequenceDiagram
     participant L as 后台加载线程
     participant C as completed_loads
     S->>S: 节点加锁，登记 Wrapper.pending_loads
-    S->>S: load 暂存 Backend.pending_loads
+    S->>S: load 暂存 linker.pending_loads
     S->>Q: start_layer_wise_loading 提交 batch
-    Q->>L: 取出 batch、counter index、ready event
-    L->>L: 等待 event，逐层 LoadAsync 和 Wait
+    L->>Q: get()
+    Q-->>L: batch、counter index、ready_event
+    L->>L: 等待准备工作完成<br/>逐层 LoadAsync 和 Wait
     Note over L: 每层就绪立即推进对应 counter<br/>计算侧等待该层 counter 后继续计算
     L->>C: 全部层结束，写入 rid 列表
     S->>C: pop_completed_load 消费通知
@@ -587,13 +875,19 @@ sequenceDiagram
     participant S as 调度侧 / Wrapper
     participant C as offload_results
     M->>Q: save_layer 提交 LAYER 与 ready event
-    Q->>O: 逐层取任务，等待 event 后 StoreAsync
+    O->>Q: get()
+    Q-->>O: LAYER、层号、ready event
+    O->>O: 等待 event 后 StoreAsync
     M->>Q: session 退出后提交 FINISH
-    Q->>O: FINISH 等待所有层 IO 完成
+    O->>Q: get()
+    Q-->>O: FINISH
+    O->>O: 等待剩余层 IO 完成
     O->>O: 设置 session completion Future
     Note over O,S: 调度侧检查 session receipt<br/>跨 rank 确认后释放源页 pin
     S->>Q: 后续 offload 提交 ACK，引用已有 receipts
-    Q->>O: ACK 汇总保存结果，不重复写出
+    O->>Q: get()
+    Q-->>O: ACK
+    O->>O: 汇总保存结果，不重复写出
     O->>C: 按接受顺序写入布尔结果
     S->>C: pop_completed_offload
     C-->>S: success
@@ -605,7 +899,7 @@ sequenceDiagram
 | 容器 | 类型 | 保存什么 | 何时取走 |
 | --- | --- | --- | --- |
 | Wrapper.pending_loads | 字典 | rid → 节点及锁记录 | 加载完成收尾时 |
-| Backend.pending_loads | 字典 | rid → transfers | start_layer_wise_loading 时 |
+| linker.pending_loads | 字典 | rid → transfers | start_layer_wise_loading 时 |
 | load_queue | 有界工作队列 | 一批加载请求及 counter index | 加载线程取任务 |
 | offload_queue | 有界工作队列 | 普通 OFFLOAD，或逐层 LAYER/FINISH/ACK 及对应 event | 卸载线程取任务 |
 | completed_loads | 完成队列 | 一批已完成的 rid | pop_completed_load |
@@ -628,110 +922,190 @@ resolve_transfers 的结果把转换后的设备索引放在 host_indices；它�
 
 ## 7. GET：从命中页到模型安全读取
 
+下面按 OD 讲解文档的方式拆成三个阶段。公共 Cache / Wrapper 流程复用现有接口，KvClient 后端内部行为为拟实现方案。图中参与者表示对象或执行位置，不表示每个对象都有自己的线程。
+
+| 图中名称 | 实际对象或执行位置 |
+| --- | --- |
+| cache | `UnifiedRadixCache` 实例；本节树侧方法由调度路径调用 |
+| wrapper | `cache.linker`，即 `UnifiedCacheLinkerWrapper` |
+| component / allocator | Cache 的树组件及已有设备内存分配器 |
+| linker | `wrapper.cache_linker`，即拟新增的 `KvClientDirectLinker` |
+| storage | `linker.storage`，即拟新增的 `KvClientStorage`；SDK 调用经 pybind 完成 |
+| counter | `linker.layer_done_counter`；设备 KV pool 和 TP worker 接入同一个对象 |
+| load thread | 同一 linker 对象的后台加载线程，执行 `_load_worker()` |
+| pool | 模型实际使用的 GPU KV pool，不是 `DevicePoolGroup` |
+
+**阶段 A：单个请求准备恢复，后端暂存任务。**
+
+前缀匹配已发现外部可恢复页，Wrapper 保存了请求的外部 hit marker。请求接纳逻辑需要恢复这些页时，调用 `cache.init_load_back()`，Cache 再转交 `wrapper.load_back(req)`。这部分在调度调用路径执行。
+
+Wrapper 通过 components 和 allocator 协调目标 slots，更新缓存树并处理重复前缀，再按实际采用范围构造加载任务。分配 slots 和插入树只准备位置及映射，不会读取外部数据。随后 Wrapper 保护节点，调用后端 `load()`；后端展开物理池任务并写入自己的 `pending_loads`。
+
 ```mermaid
 sequenceDiagram
-    participant S as 调度线程
-    participant W as Wrapper
-    participant B as KvClientDirectLinker
-    participant L as 加载线程
-    participant K as KvClientStorage
-    S->>W: load_back(req)，使用外部 hit marker
-    W->>W: 通过 components 和 allocator 分配目标 slots
-    W->>W: 更新树并构造 keys 和 device_indices
-    W->>W: _queue_load(rid, node_id, transfers)
-    W->>W: 给节点加锁
+    participant C as cache
+    participant W as wrapper
+    participant P as component
+    participant A as allocator
+    participant B as linker<br/>KvClientDirectLinker
+    Note over C: 请求接纳时调用 init_load_back(...)
+    C->>W: load_back(req)<br/>使用外部 hit marker
+    W->>P: build_external_linker_transfer(<br/>LOAD, ...)
+    P->>A: alloc(num_tokens)<br/>FULL 分配目标 slots
+    A-->>P: slots
+    P-->>W: 包含 keys 和 slots 的 transfer
+    W->>P: update_external_linker_load(<br/>PREPARE, ...)
+    W->>C: insert(...)<br/>处理重复前缀
+    C-->>W: 插入结果及采用范围
+    W->>P: COMMIT<br/>筛选实际加载范围
+    W->>C: inc_lock_ref(node_id)
     W->>B: load(rid, transfers)
-    B->>B: Backend.pending_loads 保存任务
-    B-->>W: True，接受但未读取
-    W->>W: Wrapper.pending_loads 保存节点与锁
-    S->>B: start_layer_wise_loading()
-    B->>B: 先记录当前设备 stream 的 ready event
-    B->>B: 摘取当前请求，分配 counter index
-    B->>L: 经 load_queue 交付 batch、counter index、ready event
-    B-->>S: counter index
-    L->>L: 设置设备，等待 ready event，再解析地址、长度和 offset
-    loop 按层处理 0 到 num_layers-1
-    L->>K: get_async(该层 KV 与 Indexer ranges)
-    K->>K: 查找 MR，绑定转换 KVBuffer，调用 LoadAsync
-    L->>K: wait(taskId)
-    K->>K: 经绑定调用 Wait 并检查结果
-    K-->>L: 读取结果
-    L->>L: 检查该层所有子任务成功及设备可见性
-    L->>B: 完成 counter(index, layer)，允许模型使用该层
-    end
-    L->>B: completed_loads.put(rid 列表)
-    S->>W: num_completed_loads，协调可收尾数量
-    W->>B: num_completed_loads
-    B-->>W: 待消费 batch 数量
-    S->>W: drain_loads(finish_count)
-    W->>B: pop_completed_load()
-    B-->>W: 已完成 rid 列表
-    W->>W: 移除记录并解除节点保护
+    B->>B: resolve_transfers(...)<br/>写 linker.pending_loads
+    B-->>W: True：接受，尚未 GET
+    W->>W: pending_loads 保存节点与锁
+    W-->>C: 返回目标索引和节点
 ```
 
-启动由调度侧选好本轮 batch 后触发，不是等队列攒够数量自动启动。每层读取成功后立即放行该层，加载线程继续后续层；失败必须唤醒等待方并传播异常，不能发布成功 rid。
+两个 `pending_loads` 用途不同：Wrapper 保存节点和锁，供完成后树侧收尾；linker 保存物理池传输描述，供后续启动读取。阶段 A 结束时，最终 GPU 指针尚未解析，也尚未提交 GET。`load_back()` 返回后，调度器继续选择请求，不是在这个调用内部直接进入逐层读取。
 
-### 7.1 等待位置：加载线程等待 KvClient，计算侧等待层 Future
+**阶段 B：调度器创建 new_batch 后，统一启动后台加载。**
 
-**与 Mooncake 一样：确认这一层实际读取完成后，才让该层 Future 就绪。** KvClient 的区别是通过 LoadAsync + Wait 获取完成结果，而 Mooncake 当前 linker 使用同步 range-get 返回值确认读取。
+**小例子：两个请求共用一个加载批次。** `linker.pending_loads` 是一个字典，不是每个请求各建一个字典；请求 A、B 分别是其中两个条目。DSA 展开后，每个请求的列表中包含 KV / Indexer 两个物理池任务：
+
+```python
+# 示意结构，实际列表元素为 PoolTransfer，索引为 tensor。
+linker.pending_loads = {
+    "req_A": [A_kv_transfer, A_indexer_transfer],
+    "req_B": [B_kv_transfer, B_indexer_transfer],
+}
+
+pending = linker.pending_loads
+linker.pending_loads = {}  # 后续新任务写入新的待启动字典
+index = linker.layer_done_counter.update_producer()
+# 记录当前设备 stream 的 ready_event 后：
+linker.load_queue.put((index, pending, ready_event))
+```
+
+这里的 `index` 是 **counter 为本批加载分配的编号**，用于关联这一批的逐层 Futures；不是请求 rid、GPU slot 或 SDK TaskId。上例只有一个加载批次、一个 index，包含两个请求。计算侧通过 `set_consumer(index)` 选择该批次，再通过 `wait_until(layer)` 等待对应层。
+
+后台负责逐层 GET，不需要上层按层反复调用 `load()`。每层汇集这批请求对应的 KV / Indexer ranges，调用一次 `storage.get_async(ranges)`，随后 Wait 并校验结果；确认本层两池成功且设备可见后，调用 `counter.complete(index, layer)`：
 
 ```text
-加载线程：
-  LoadAsync（第 N 层 KV + Indexer）
-  → Wait(taskId)，等待该层任务结束
-  → 检查该层全部任务和逐条结果成功，确认设备数据可见
-  → counter.complete(index, N)
-      → Future.set_result(None)
-
-计算侧：
-  layer_done_counter.wait_until(N)
-  → Future.result() 返回
-  → 使用第 N 层 KV
+同一批 pending = {req_A: [...], req_B: [...]}
+  → 第 0 层：读取 A + B 所需的 KV / Indexer → 放行本批第 0 层计算
+  → 第 1 层：读取 A + B 所需的 KV / Indexer → 放行本批第 1 层计算
+  → ……直到本 worker / pool group 的全部必要层
+  → 发布本批完成请求 IDs：[req_A, req_B]
 ```
 
-**Future 就绪表示该层数据已经可用，不能只表示 IO 已提交。** 一层一次 LoadAsync，Wait 汇总 SDK 内部子任务；失败则给尚未完成的 Future 设置异常。Wait 成功是否已包含设备可见性保证，需核实 provider；若需要额外同步，应在 complete 前完成。
+PoolTransfer 指定页和 slots，不单独指定层范围，因此默认恢复这些页在当前 worker / pool group 全部必要层的数据；有 PP 时不代表每个 worker 都读取整个模型。某层加载完成即可计算该层，不必等全批所有层结束。
 
-KvClient 暴露 TaskId、Check 和阻塞 Wait，没有公开的可供计算 stream 等待的设备完成 event。Wait 的当前实现等待 CPU 条件变量。因此选择加载线程独占消费 Load task 的 Wait；计算侧通过 layer_done_counter.wait_until(layer) 等待 Future，不直接消费同一个 TaskId。
+实际公共入口为 `Scheduler → cache.ready_to_load_host_cache() → wrapper.start_layer_wise_loading() → linker.start_layer_wise_loading()`。为控制图宽，下面从后端入口画起。
+
+启动方法摘取当前暂存任务，为本批分配 counter index 和逐层 Futures，再将任务交给加载线程。拟参照现有 Mooncake 加载路径，在调用侧当前设备 stream 记录 `ready_event`，后台等待它后再处理加载任务。这里沿用代码命名，含义是“前序设备准备工作已完成”，不表示外部数据已经读回，也不等同于 PUT 的源数据就绪事件。该事件所需覆盖的 stream 依赖仍须在 KvClient 接入时验证。index 沿调用链返回，保存到模型 batch；返回 index 不代表读取完成。
+
+
 
 ```mermaid
 sequenceDiagram
-    participant M as 模型执行侧 CPU 线程
-    participant F as 每层 Future
+    participant B as linker<br/>KvClientDirectLinker
+    participant K as counter
     participant L as 加载线程
-    participant K as KvClient
-    L->>K: LoadAsync 第 0 层两池
-    K-->>L: taskId 0
-    L->>K: Wait(taskId 0)
-    M->>F: wait_until(0)，未就绪则阻塞
-    K-->>L: 第 0 层任务完成
-    L->>L: 检查两池结果及设备可见性
-    L->>F: complete(0)
-    F-->>M: 第 0 层可用
-    par 后台继续读取
-        L->>K: LoadAsync 第 1 层两池
-        L->>K: Wait(taskId 1)
-    and 计算当前层
-        M->>M: 提交第 0 层模型计算
+    participant S as storage
+    participant V as KvClient SDK<br/>经 _kvclient.Client 绑定
+    Note over B: 调用侧执行<br/>start_layer_wise_loading()
+    B->>B: 摘取 pending_loads<br/>记录准备同步事件 ready_event
+    B->>K: update_producer()
+    K-->>B: index；已建立本批逐层 Futures
+    B->>B: linker.load_queue.put((index, pending, ready_event))
+    Note over B: index 沿调用链返回<br/>保存到 new_batch
+    Note over L: 此线程正在执行同一 linker 对象的 _load_worker()
+    L->>L: 从 linker.load_queue.get() 取出任务并解包
+    L->>L: 设置设备，等待 ready_event 确认前序准备完成
+    L->>L: 遍历 pending 中的 transfers<br/>entry = linker.pool_group.entry_map[transfer.name]
+    L->>L: locations = entry.prepare_locations(<br/>transfer.host_indices)<br/>校验页对齐并将 slots 换算为行号
+    loop 按层处理 0 到 num_layers-1
+        L->>L: entry.get_prepared_layer_range_meta(locations, layer)<br/>得到本层地址、长度和布局偏移，再查统一远端 offset 表
+        L->>S: get_async(本层两池 ranges)
+        S->>S: 查注册 handle，组装 entries
+        S->>V: LoadAsync(entries)
+        V-->>S: 提交状态和本层 taskId
+        S-->>L: 本层 taskId
+        L->>S: wait(taskId)
+        S->>V: Wait(taskId, timeout, result)
+        V-->>S: 等待状态、任务状态及逐条结果
+        S->>S: 校验整体及逐条结果
+        S-->>L: 本层读取结果
+        L->>L: 确认两池成功且设备可见，必要时额外同步
+        L->>K: complete(index, layer)
     end
-    M->>F: 第 1 层使用 KV 前 wait_until(1)
+    L->>L: linker.completed_loads.put(本批请求 IDs)<br/>供 Wrapper 后续消费并解除节点保护
 ```
 
-| 实现 | IO 完成等待 | 计算侧使用数据前的等待 |
-| --- | --- | --- |
-| Mooncake | 加载线程调用同步 range get，返回后推进层 Future | 等待该层 Future |
-| OD | 提交后将设备 IO events 交给 Future；后台还等待批次收尾 | 等待 Future 取得 events，再 event.synchronize |
-| KvClient 本设计 | 加载线程 Wait 消费 TaskId，成功且可见后推进 Future | 等待层 Future |
-| ASU Store | Load 返回 TaskHandle；Wait 方法在调用它的线程阻塞 | 由 ASU 的上层调用者安排，AsuStore 本身不规定线程 |
+Storage 和 counter 都不是独立线程。这里的 `get_async()`、`wait()` 及 `complete()` 由加载线程调用；加载线程正在执行同一个 linker 对象的方法，不是另一份 linker。与 OD 的 continuation / 设备 IO events 路径不同，本设计由加载线程逐层提交 LoadAsync 并 Wait，确认本层两池成功且设备可见后才推进 Future。
 
-OD 的 Future 就绪可以只表示“设备 events 已提交”，KvClient 本设计的 Future 就绪则必须表示“该层数据已可读”。不能把 SDK TaskId 当成 CUDA event，也不能在计算侧和加载线程各 Wait 一次同一 task。
+**阶段 C：计算侧通过共享 counter 等待本层数据，调度侧另行处理树侧收尾。**
 
-让计算线程直接调用 SDK Wait 也可另行实现，但必须增加 TaskId 发布、唯一消费、异常和批次收尾协调；现有接口并不要求这样做。首选后台 Wait + 计算侧 Future，便于保持 Wrapper 的线程职责，也不阻碍逐层加载与模型计算重叠。
+该阶段可以与阶段 B 的后台读取交错。TP worker 用 batch 的 index 选择本次加载；attention 获取某层 buffer 时，pool 通过同一个 counter 等待该层 Future。Future 成功返回后才使用本层数据，不必等待后续所有层加载完成。
 
-需要提高 IO 在途深度时，可先提交有限窗口的后续层 task，再按层 Wait 并推进对应 Future；不能先等全模型所有层完成再集中放行。该优化不改变等待的线程归属。
+**`wait_until()` 负责“等通知”，`complete()` 负责“发通知”，两者是一对。** 计算侧等待对应层的 Future；加载线程确认该层读取成功且设备可见后，通过 `complete(index, layer)` 将它标记为就绪。Mooncake 也采用这一机制。
 
-**完成契约需验证**：SDK Wait 当前等待客户端任务状态，并不单凭这段代码证明设备写入已对计算可见。必须验证 provider 的完成保证；若需额外设备同步，由加载线程在 complete(layer) 前执行。绑定在 Wait 期间释放 GIL。
+```text
+计算侧                              加载线程
+wait_until(0)                       读取第 0 层
+  → Future.result() 等待                ↓
+                                    complete(index, 0)
+  ← Future 就绪，等待结束 ←──────────────┘
+继续第 0 层计算
+```
 
-### 7.2 Mooncake 与 KvClient：逐层调用方式对比
+如果调用 `wait_until()` 时该层已经完成，就直接返回；否则等加载线程通知。`complete()` 不执行 GET，也不解除节点锁。
+
+加载线程负责消费 SDK TaskId 的 Wait，计算侧只等待层 Future，不对同一个 TaskId 再次 Wait。Future 成功就绪必须表示本层数据已可读；若 provider 需要额外设备同步，须在 complete 前完成。读取失败则给尚未完成的 Future 设置异常，唤醒等待方。
+
+```mermaid
+sequenceDiagram
+    participant T as TP worker
+    participant M as attention
+    participant P as pool
+    participant K as counter
+    T->>K: set_consumer(<br/>batch.hicache_consumer_index)
+    Note over M: 模型执行到第 N 层
+    M->>P: 获取 KV / Indexer buffer
+    P->>K: wait_until(<br/>layer_id - start_layer)
+    K->>K: Future.result()<br/>等待本层读取成功且设备可见
+    K-->>P: 该层可读
+    P-->>M: 返回 GPU buffer
+    M->>M: 继续本层计算<br/>后台可继续读取后续层
+```
+
+全部层加载结束后，加载线程发布请求 IDs 完成通知。调度侧通过 `cache.check_hicache_events()` 协调各 rank 可收尾数量，再由 Wrapper 消费通知并解除保护：
+
+```mermaid
+sequenceDiagram
+    participant C as cache
+    participant W as wrapper
+    participant B as linker<br/>KvClientDirectLinker
+    Note over C: 调度侧调用 check_hicache_events()<br/>协调各 rank 可收尾数量
+    C->>W: drain_loads(finish_count)
+    W->>B: pop_completed_load()
+    B-->>W: 已完成 rid 列表
+    W->>W: 移除对应在途记录
+    W->>C: dec_lock_ref(<br/>node_id, lock_params)
+```
+
+节点锁防止加载期间 slots 被回收；层 Future 防止计算提前读取。加载线程只发布通知，操作缓存树解锁的是 Wrapper。解除加载保护不等于立刻释放 slots，数据仍用于推理和后续前缀复用。
+
+| 时点 | 含义 |
+| --- | --- |
+| `load()` 返回 True | 后端接受任务，尚未读取 |
+| `start_layer_wise_loading()` 返回 index | 本批读取已交付后台，尚未证明数据可用 |
+| 某层 Future 成功就绪 | 本设计要求该层两池读取成功且设备可见 |
+| Wrapper 消费完成通知并解锁 | 本次树侧加载保护已解除，不代表释放 slots |
+
+启动由调度侧选好本轮 batch 后触发，不是等队列攒够数量自动启动。失败必须唤醒等待方并传播异常，不能发布成功 rid；未确认 IO 安全结束时，不能提前解除资源保护。
+
+### 7.1 Mooncake 与 KvClient：逐层调用方式对比
 
 两者都在加载线程逐层读取，完成一层就放行一层，不是一次下发全部层后统一等待。
 
@@ -812,6 +1186,8 @@ sequenceDiagram
     T->>W: 前向前 prepare_layerwise_save(batch)
     W->>W: 规划新增完整页、hash 和源 slots
     W->>S: begin_layerwise_save(transfers, phase)
+    S->>S: linker.pool_group.resolve_transfers(transfers)<br/>将逻辑任务展开为 KV / Indexer 物理池任务
+    S->>S: 创建 session，保存展开后的 transfers<br/>及页 key 对应的 completion receipts
     S-->>W: session，页 key 对应 completion receipts
     W->>W: pin 源页，绑定 release_source 和 on_submitted
     W-->>T: forward_batch.layerwise_kv_saver = session
@@ -854,13 +1230,20 @@ with ctx_mgr, saver if saver is not None else contextlib.nullcontext():
 sequenceDiagram
     participant Q as offload_queue
     participant B as Offload worker
+    participant E as DevicePoolEntry
     participant S as KvClientStorage
     participant K as kv::KvClient 经 pybind
+    Note over B,E: session 的 transfers 已展开为两池任务<br/>按 name 找 Entry，prepare_locations(host_indices)<br/>所得 locations 可缓存并跨层复用
     loop 从队列逐层取任务
         B->>Q: get()
         Q-->>B: LAYER(session, layer, ready_event)
-        B->>B: 设置设备，等待 ready_event 完成
+        B->>B: 指定本 worker 的 GPU，等待 ready_event 完成
         Note over B: 此时才确认该层 KV / Indexer 数据就绪
+        loop 本层 KV / Indexer 两池
+            B->>E: get_prepared_layer_range_meta(locations, layer)
+            E-->>B: 本层源地址、长度和布局偏移
+            B->>B: 查统一远端 offset 表，汇集本层 ranges
+        end
         B->>S: put_async(本层 KV 和 Indexer ranges)
         S->>S: 查注册 handle，准备 key、addr、size、offset
         S->>K: StoreAsync(entries, taskId)
@@ -1024,15 +1407,25 @@ sequenceDiagram
     participant Q as offload_queue
     participant B as Offload worker
     participant S as KvClientStorage
+    participant E as DevicePoolEntry<br/>初始化时已创建
     W->>D: offload(transfers)
-    D->>D: resolve_transfers 展开 KV / Indexer
+    D->>D: pool_group.resolve_transfers(transfers)<br/>展开 KV / Indexer 物理池任务
     D->>D: 在生产 stream 记录 ready event
-    D->>Q: put(OFFLOAD, transfers, ready_event)
+    D->>Q: put((OFFLOAD, transfers, ready_event))
     D-->>W: True，仅表示接受任务
     B->>Q: get()
     Q-->>B: OFFLOAD、transfers、ready_event
-    B->>B: 设置设备，等待 ready event 完成
-    B->>B: 根据源 slots 解析全部必要层 ranges
+    B->>B: 指定本 worker 的 GPU<br/>等待 ready event，确认源数据已产出
+    loop 遍历两池 transfers
+        B->>B: entry = linker.pool_group.entry_map[transfer.name]
+        B->>E: prepare_locations(transfer.host_indices)
+        E-->>B: locations：源 slots 对应的行号
+        loop 遍历本池全部必要层
+            B->>E: get_prepared_layer_range_meta(locations, layer)
+            E-->>B: 本层源地址、长度和布局偏移
+            B->>B: 查统一远端 offset 表<br/>汇集到全部层 ranges
+        end
+    end
     B->>S: put_async(全部层 KV / Indexer ranges)
     S->>S: 经绑定调用一次 StoreAsync(entries, taskId)
     S-->>B: 一个 TaskId

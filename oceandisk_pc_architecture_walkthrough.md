@@ -561,9 +561,11 @@ sequenceDiagram
     participant K as counter
     participant B as load thread
     Note over D: start_layer_wise_loading() 在调用侧执行
+    D->>D: _ready_event()<br/>在当前设备 stream 记录准备事件
     D->>K: update_producer()，创建批次逐层 Futures
     K-->>D: index
-    D->>D: 取 pending_loads，构造每层 I/O 地址描述
+    D->>D: 取 pending_loads<br/>event.synchronize() 等前序准备完成
+    D->>D: _get_transfer_layers(...)<br/>构造每层 I/O 地址描述
     D->>S: get_layers(..., defer_remaining=True)
     S->>S: 提交第 0 层 GET
     S->>K: 经 on_layer_submitted 回调 complete(index, 0, events)
