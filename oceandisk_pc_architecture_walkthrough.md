@@ -158,13 +158,26 @@ classDiagram
 
 **图 B：OD 后端如何使用池视图和存储执行层。**
 
+OD 类框中同时列出队列、线程和 worker 方法，以明确它们属于同一个后端对象。`_load_thread` 的 target 是 `self._load_worker`，`_offload_thread` 的 target 是 `self._offload_worker`；线程不是另外一个 linker 对象。下划线成员在图中用 `-` 表达内部使用约定，Python 不强制 UML private 访问权限。
+
 ```mermaid
 classDiagram
     direction LR
     class OceanDiskDirectLinker {
         +pool_group
         +storage
+        +pending_loads
+        +load_queue
+        +offload_queue
+        +completed_loads
+        +offload_results
+        -_load_thread
+        -_offload_thread
         +load(rid, transfers)
+        +start_layer_wise_loading()
+        +offload(transfers)
+        -_load_worker()
+        -_offload_worker()
     }
     class DevicePoolGroup {
         +entries
@@ -491,33 +504,108 @@ sequenceDiagram
 
 ## 7. GET：从外部命中到模型安全读取
 
+先明确图里的对象，下面三个阶段使用相同别名，不把 Cache、Wrapper、pool 合并成一个参与者：
+
+| 图中名称 | 实际对象或执行线程 |
+| --- | --- |
+| cache | `UnifiedRadixCache` 实例 |
+| wrapper | `cache.linker`，即 `UnifiedCacheLinkerWrapper` 实例 |
+| component | Cache 中的 FULL 等树组件；分配工作调用已有 allocator |
+| od | `wrapper.cache_linker`，即 `OceanDiskDirectLinker` 实例 |
+| storage | `od.storage`，即 `OceanDiskStorage` 实例 |
+| counter | `od.layer_done_counter`；TP worker 和 KV pool 共享这个对象 |
+| load thread | `od._load_thread`，执行同一 od 对象的 `_load_worker()`，不是另一份 linker |
+| pool | 模型使用的 GPU KV pool；不是 DevicePoolGroup |
+
+**阶段 A：单个请求准备恢复，OD 暂存任务。** 此处入口是请求接纳逻辑调用的 `cache.init_load_back()`。
+
+此前前缀匹配已经发现 OceanDisk 有可恢复的页面，Wrapper 保存了该请求的 hit marker。调度器尝试接纳这个请求、需要恢复外部缓存时，Cache 将调用转给 `wrapper.load_back(req)`。
+
+这一阶段先解决“读哪些页、放到哪里”：FULL component 根据页 hashes 调用分配器取得目标 GPU slots，再构造 `PoolTransfer`。**准备 slots 是分配可用的 GPU KV 存储位置；插入树是将“前缀 → slots”的映射登记到缓存树，两者都不会把外部 KV 数据读回来。** Wrapper 协调 components 完成插入，处理已有的重复前缀，并按插入结果筛选实际需要加载的页面和 slots；随后保护目标节点，避免加载期间内存被回收。数据真正读回后，计算侧还需通过逐层 events 确认就绪再读取。
+
+最后，Wrapper 把任务交给 `od.load()`。OD 将逻辑任务展开为 KV、Indexer 物理池任务，存入 `pending_loads` 字典。**阶段 A 结束时，树侧目标位置与保护已安排，后端任务已暂存，但还没有发起 GET，也没有算出本次目标的最终 GPU 指针。** `load_back()` 随后返回，调度器继续自身流程；阶段 B 由后面的独立调用触发。
+
 ```mermaid
 sequenceDiagram
-    participant W as Wrapper / Cache
-    participant D as DirectLinker
-    participant S as Storage
-    participant B as Load worker
-    participant M as 模型 / KV pool
-    W->>W: PREPARE 分配 slots，插入树，COMMIT 选择实际采用页面
-    W->>W: 增加目标节点锁引用
+    participant C as cache
+    participant W as wrapper
+    participant P as component
+    participant A as allocator
+    participant D as od
+    C->>W: load_back(req)
+    W->>P: build_external_linker_transfer(LOAD, ...)
+    P->>A: alloc(num_tokens)，FULL 分配目标 slots
+    A-->>P: slots
+    P-->>W: 包含 keys 和 slots 的 transfer
+    W->>P: update_external_linker_load(PREPARE, ...)
+    W->>C: insert(...)，处理重复前缀
+    C-->>W: 插入结果及采用范围
+    W->>P: COMMIT，筛选和协调实际加载范围
+    W->>C: inc_lock_ref(node_id)
     W->>D: load(rid, transfers)
-    D-->>W: True：接受并排队
-    W->>D: start_layer_wise_loading()
-    D->>D: 生成批次 counter index 和向量化 I/O 描述
-    D->>S: get_layers(..., defer_remaining=True)
-    S->>S: 提交第 0 层 GET，发布可等待 events
-    S-->>D: 后续层 continuation
-    D->>B: 入队 continuation
-    D-->>W: consumer index
-    B->>S: 执行 continuation
-    S->>S: 提交其余层并等待末尾完成
-    M->>D: counter.wait_until(layer)
-    D->>D: 等待 Future，再同步该层 events
-    D-->>M: 该层数据可使用
-    B->>D: 写入 completed_loads 请求 ID 批次
-    W->>D: 消费已完成批次
-    W->>W: 释放目标节点锁引用
+    D->>D: resolve_transfers，写 pending_loads
+    D-->>W: True：接受任务，尚未 GET
+    W-->>C: 返回目标索引和节点
 ```
+
+**阶段 B：调度器创建 new_batch 后启动加载。** 为控制图宽，下图从后端方法入口画起；实际调用仍是 `Scheduler → cache.ready_to_load_host_cache() → wrapper.start_layer_wise_loading() → od.start_layer_wise_loading()`。
+
+请求选择循环结束且有可运行请求时，调度器创建 `new_batch`，在 `prepare_for_extend()` 之前执行上述启动调用。OD 一次取出当前 `pending_loads` 中的任务，可能包含一个或多个请求，为这批加载创建 index 和各层 Future，再结合 slots 与池布局生成具体 GPU 地址和 I/O 描述。
+
+Storage 先提交第 0 层 GET，并把该层可等待的 events 通过回调发布到 counter；随后返回处理其余层的 continuation。OD 将它放入 `load_queue`，由独立加载线程执行后续提交和读取收尾。**启动方法返回 index，不等于所有层已经读完；这个 index 随模型 batch 传递，用于阶段 C 选定要等待的加载批次。** 后台线程收尾后还会发布请求 ID 完成通知，供树侧解除保护。
+
+```mermaid
+sequenceDiagram
+    participant D as od
+    participant S as storage
+    participant K as counter
+    participant B as load thread
+    Note over D: start_layer_wise_loading() 在调用侧执行
+    D->>K: update_producer()，创建批次逐层 Futures
+    K-->>D: index
+    D->>D: 取 pending_loads，构造每层 I/O 地址描述
+    D->>S: get_layers(..., defer_remaining=True)
+    S->>S: 提交第 0 层 GET
+    S->>K: 经 on_layer_submitted 回调 complete(index, 0, events)
+    S-->>D: 返回 finish 函数作为 continuation
+    D->>D: load_queue.put(index, pending, continuation)
+    Note over D: index 沿调用链返回并保存到 new_batch
+    Note over B: 此线程正在执行 od._load_worker()
+    B->>B: 从 od.load_queue.get() 取出任务并解包
+    B->>S: continuation()，在后台线程执行 finish
+    S->>S: 提交其余层 GET
+    S->>K: 经回调发布后续层 events
+    S->>S: 等各提交批次末层 events，确认读取收尾
+    S-->>B: continuation 返回
+    B->>B: 向 od.completed_loads 写入本批请求 IDs
+```
+
+storage 和 counter 不是各自独立的线程；图中的调用由当前执行线程完成。阶段 B 的前半在启动加载的调用侧执行，continuation 部分在 load thread 执行。**load thread 正在执行的就是同一个 od 对象的 `_load_worker()`：取任务后直接调用 Storage 返回的 finish 函数，不需要再调用一次 OD 的 load 方法。** 图中的队列取出、解包和完成通知写入均画成该线程内部动作，队列仍是 od 的成员。
+
+**阶段 C：计算侧获取 buffer，通过共享 counter 等待数据。** 该阶段可与后台读取交错，不是必须等阶段 B 全部结束才开始。
+
+TP worker 在模型前向前，用 batch 保存的 index 调用 `counter.set_consumer(index)`，明确本次前向对应哪批加载。attention 需要某层历史 KV 时调用 pool getter，pool 不会立即返回 buffer，而是先进入同一个 counter 的 `wait_until(本地层号)`。
+
+等待分两步：先从该层 Future 取得 events，若尚未发布就等发布；再同步这些 events，确认该层所需 GET 已完成。之后 getter 才返回 GPU buffer，attention 继续使用数据。**这一步保证“读取前数据已就绪”；阶段 B 的后台线程收尾和完成队列则保证“何时可以清理加载任务、解除内存保护”，两者用途不同。** 如果当前层已经就绪，等待会很快返回，不必再等后续所有层。
+
+```mermaid
+sequenceDiagram
+    participant T as TP worker
+    participant M as attention
+    participant P as pool
+    participant K as counter
+    T->>K: set_consumer(batch.hicache_consumer_index)
+    Note over M: 模型执行到第 N 层
+    M->>P: get_key_buffer(layer_id)
+    P->>K: wait_until(layer_id - start_layer)
+    K->>K: Future.result() 等本批该层 events 发布
+    K->>K: event.synchronize() 等该层 GET 完成
+    K-->>P: 该层可读
+    P-->>M: 返回 GPU KV buffer
+    M->>M: 继续使用 KV 计算 attention
+```
+
+最后由调度侧的 `cache.check_hicache_events()` 协调各 rank 完成数量，调用 `wrapper.drain_loads()`；Wrapper 从 `od.pop_completed_load()` 取请求 IDs，再调用 `cache.dec_lock_ref()`。**加载线程只发布完成通知，操作树解锁的是 Wrapper。** Indexer buffer 有自己的 getter，最终也调用同一个 counter，详见第 7.5 节。
 
 这里有三个不同的“完成”：
 
@@ -635,15 +723,30 @@ new_batch.prepare_for_extend()
 
 调度器调用 `req.init_next_round_input(tree_cache)`，内部进行前缀匹配：Cache 先查 GPU 树，Wrapper 再查询 GPU 未命中部分在 OceanDisk 是否存在；若有可恢复前缀，记录 A 的 hit marker，并把命中结果写回请求。
 
-随后 `adder.add_one_req(A, ...)` 尝试接纳 A。需要恢复时，通过 `cache.init_load_back()` 调用 `Wrapper.load_back(A)`：
+这里的 `init_next_round_input()` 是 **Req 对象的方法，用来为请求准备下一轮输入及前缀缓存匹配状态**，定义在 `managers/schedule_batch.py`。在当前 PC 流程中，重点看它如何选定本轮可匹配的 token 范围、调用 `tree_cache.match_prefix()`，并将匹配结果更新到请求的 `prefix_indices`、`last_node`、`host_hit_length` 等字段。Wrapper 的外部查询和 hit marker 记录，是在这次 `match_prefix()` 调用内部完成的。
+
+**这个函数负责查清“已有多少缓存、还有多少可以从外部恢复”，不在这里为外部恢复分配目标 slots，也不调用 OD.load() 或启动 GET。** 它内部的查询流程是：
 
 ```text
-FULL component 调用 allocator 分配目标 GPU slots
-  → 协调 components，插入树并筛选实际采用的页面
-  → 增加目标节点锁引用
-  → OD.load(A, transfers)
-      → 展开 KV / Indexer 物理池任务
-      → pending_loads[A] = A 的任务
+req.init_next_round_input(tree_cache)
+  → 准备本轮输入与匹配范围
+  → cache.match_prefix()：GPU 匹配 + Wrapper 外部查询
+  → 更新请求匹配状态；有外部命中时 Wrapper 保存 hit marker
+  ← 返回
+```
+
+查询返回后，调度器调用 `adder.add_one_req(A, ...)` 尝试接纳 A。接纳流程检查条件，并在需要恢复时准备目标位置和加载任务：
+
+```text
+adder.add_one_req(A, ...)
+  → 检查接纳条件，需要恢复时调用 cache.init_load_back()
+      → Wrapper.load_back(A)
+          → FULL component 调用 allocator 分配目标 GPU slots
+          → 协调 components，插入树并筛选实际采用的页面
+          → 增加目标节点锁引用
+          → OD.load(A, transfers)
+              → 展开 KV / Indexer 物理池任务
+              → pending_loads[A] = A 的任务
 ```
 
 `transfers` 说明“读取哪些页、放到哪些 slots”。到这里任务只是暂存，还没有 GET。
@@ -812,13 +915,13 @@ self._load_thread.start()
 
 ## 8. PUT：默认逐层保存，以及普通保存模式
 
-### 8.1 默认 PC 逐层保存：前向产出一层，后台保存一层
+### 8.1 默认 PC 逐层保存：计算侧逐层提交任务，后台等数据就绪后保存
 
-当前 OD 默认启用 `layerwise_save`。`registry.py` 在支持的模型条件下将 Wrapper 接到 TP worker；`tp_worker.py` 准备 forward session，模型层钩子在 KV / Indexer 产出后调用 saver。
+当前 OD 默认启用 `layerwise_save`。`registry.py` 在支持的模型条件下将 Wrapper 接到 TP worker；`tp_worker.py` 准备 forward session。计算侧 CPU 执行到该层 attention 的 Python 调用返回后，通过模型层钩子调用 saver。**这只表示计算侧程序走到了保存位置，不代表 GPU 已经执行完成，也不代表本层 KV / Indexer 已可供 PUT 读取。** 后台通过 ready event 确认源数据就绪后才提交 PUT。
 
 ```mermaid
 sequenceDiagram
-    participant T as TP worker / 模型
+    participant T as 计算侧 CPU / 模型前向
     participant W as Wrapper
     participant D as DirectLinker / Session
     participant B as Offload worker
@@ -830,11 +933,11 @@ sequenceDiagram
     W->>W: pin_pages_for_io，绑定 release_source
     W-->>T: session
     loop 每个传输层
-        T->>T: 产出本层 KV / Indexer
-        T->>D: session.save_layer(layer)
-        D->>B: 层任务 + GPU ready event
+        T->>T: 计算侧执行到本层保存钩子，GPU 可能仍在执行
+        T->>D: session.save_layer(layer)，记录当前计算 stream 的 ready event
+        D->>B: 层任务与 ready event 入队
         B->>S: 准备 metadata，submit_put_layer(...)
-        S->>S: 等待生产依赖并提交 PUT
+        S->>S: ready_event.synchronize()，确认源数据就绪后提交 PUT
     end
     T->>D: 退出 session，入队收尾任务
     B->>S: 记录并等待最终保存事件
@@ -845,7 +948,7 @@ sequenceDiagram
 
 prepare 阶段主要处理完整新页，不是每次把全部历史 KV 重存一遍。当前还有 allocator 类型、forward mode、speculative decoding 和多模态等条件限制，具体看 `prepare_layerwise_save()` 的 guards。
 
-ready event 保护“GPU 生产完成后再读源数据”；pin / lease 保护“PUT 结束前源页不能被重用”。发生 forward 中断或 PUT 失败，也必须先排空已提交 I/O，再释放源页。
+ready event 保护“GPU 生产完成后再读源数据”；pin / lease 保护“PUT 结束前源页不能被重用”。计算侧记录 event 并入队后可继续执行，等待 ready event 的是后台 offload 线程。event 确认的是记录它的 stream 上此前工作的完成；其他生产 stream 必须已建立正确依赖。发生 forward 中断或 PUT 失败，也必须先排空已提交 I/O，再释放源页。
 
 ### 8.2 树侧 offload 如何确认这些保存
 
@@ -868,6 +971,122 @@ flowchart TD
 **逐层模式下，树侧 `offload()` 主要确认已有保存，不重复执行整页 PUT，也不自动重试失败的逐层 PUT。** 缺失 receipt 同样导致确认失败。
 
 关闭逐层保存时，树侧 offload worker 才走普通 `Storage.put_layers()` 路径，等待所需保存完成后输出结果。非 owner 的本地成功不等于全局已保存，树侧还要与实际写入者的结果共同归约。
+
+### 8.3 普通卸载：layerwise_save=False 的完整流程
+
+**普通卸载由树侧 BackupKV 动作触发，后台 worker 构造所有层的 I/O 描述，再调用 `Storage.put_layers()` 保存。** 不走模型每层的 `save_layer()` 钩子，也不依赖逐层保存的 session / receipts。
+
+以下按实际写入 owner 的正常路径讲解：
+
+```mermaid
+sequenceDiagram
+    participant C as cache
+    participant W as wrapper
+    participant D as od
+    participant B as offload thread
+    participant S as storage
+    C->>W: BackupKV → offload_nodes(node_ids)
+    W->>C: 构造源页面 transfers，inc_lock_ref()
+    W->>D: offload(transfers)
+    D->>D: 展开 KV / Indexer，记录源数据 ready event
+    D->>D: offload_queue.put(expanded, ready_event)
+    D-->>W: True：任务接受，尚未保存完成
+    W->>W: 记录 pending offload 和节点锁信息
+    B->>D: offload_queue.get()
+    B->>B: ready_event.synchronize()，等源数据生产完成
+    B->>D: _run_transfers(write=True)，在后台线程执行
+    D->>D: 根据源 slots 构造所有层 I/O 描述
+    D->>S: put_layers(layers)
+    S->>S: 打包 metadata，提交多层 batch_dispatch_put
+    Note over S: 原生封装遍历层描述，调用各层 GIDS PUT 并记录 events
+    S->>S: 每个提交批次 events[-1].synchronize()
+    S-->>D: 保存调用完成，异常则传播失败
+    D-->>B: 返回执行结果
+    B->>D: offload_results.put(success)
+    Note over C,W: 调度侧后续 check_hicache_events()，协调可消费数量
+    C->>W: take_completed_offloads(count)
+    W->>D: 消费对应 offload_results
+    D-->>W: 本地保存结果
+    W-->>C: 本地保存结果
+    C->>C: 跨 rank 汇总成功状态
+    C->>W: commit_completed_offloads(successes)
+    W->>C: 更新外部副本状态，dec_lock_ref()
+```
+
+`od` 与 `storage` 是对象，不是各自的执行线程。图中 offload thread 执行同一 od 对象的 `_offload_worker()`，并在这个线程内调用 OD 和 Storage 的方法。生产 ready event 与 PUT 完成 event 是两种不同的事件。
+
+```text
+① 树侧产生 BackupKV action
+   → Wrapper.offload_nodes(node_ids)
+       → 从节点构造 PoolTransfer：页 keys + 已有源 GPU slots
+       → inc_lock_ref() 保护源节点，防止源内存被回收
+       → OD.offload(transfers)
+
+② OD 接受并排队
+   → Group.resolve_transfers() 展开 KV / Indexer 物理池任务
+   → 记录 ready event，关联此前 GPU 源数据的生产工作
+   → offload_queue.put((expanded, ready_event))
+   → 返回 True：只表示接受任务
+   → Wrapper 标记 pending，保存本次节点保护信息
+
+③ 独立 offload 线程执行 _offload_worker()
+   → 从 offload_queue 取任务
+   → ready_event.synchronize()，等源 KV 数据生产完成
+   → _run_transfers(transfers, write=True)
+       → _transfer_layers() / _page_fragments()
+       → 结合源 slots 和池布局构造各层 key / pointer / size / offset
+       → Storage.put_layers(layers)
+
+④ Storage 提交所有层的数据并等待完成
+   → 在 PUT stream 上打包、上传原生 metadata
+   → 按容量组织一个或多个提交批次
+   → batch_dispatch_put() 传入多层描述及各层 event handles
+   → 原生封装遍历各层描述，分别调用 kvcache_put() / gids_put_batch()
+   → 对每个提交批次，等待 events[-1]，即其末层 event
+
+⑤ worker 发布结果，树侧提交并解锁
+   → offload_results.put(success)
+   → Cache.check_hicache_events() 跨 rank 协调完成数量和结果
+   → Wrapper.commit_completed_offloads(successes)
+       → 更新节点外部副本状态
+       → dec_lock_ref() 解除本次源节点保护
+```
+
+普通卸载使用的是已有 KV 数据的源 slots，不需要像 GET 那样新分配目标 slots。**“卸载”在这里是保存外部副本，不表示调用 offload 后立即释放 GPU 数据**；是否回收仍由缓存树及其引用状态决定。
+
+#### 普通模式要等哪两种 event？
+
+| 等待 | 在哪里执行 | 含义 |
+| --- | --- | --- |
+| 生产 ready event | offload worker 提交 PUT 前 | 确认此前 GPU 工作已产出源数据，可以读取 |
+| PUT 完成 event | worker 调用的 `Storage.put_layers()` 内 | 确认保存工作收尾，可以报告结果 |
+
+`put_layers()` 的实际同步代码是：
+
+```python
+for _, _, _, _, events in submitted:
+    if events:
+        events[-1].synchronize()
+```
+
+这里不是逐层调用 `synchronize()`，而是每个提交批次只同步末层 event。原生封装在对应层算子调用后，将 event 记录在同一 PUT stream 上；使用末层 event 确认前序工作，依赖 GIDS 正确将 I/O 完成依赖接入该 stream。
+
+这也不意味着底层只调用一次 GIDS：上层可一次传多层描述，原生封装仍遍历描述逐层调用；更不意味着每一层必须写完后，CPU 才提交下一层。
+
+#### 与逐层保存的最小对照
+
+| 对比 | 普通模式 | layerwise 模式 |
+| --- | --- | --- |
+| 真正 PUT 的触发源 | 树侧 BackupKV / offload | 模型层保存钩子 |
+| 源数据就绪等待 | 本次 offload 的 ready event | 每层任务的 ready event |
+| 提交方式 | worker 构造所有层描述，调用 put_layers | worker 按层调用 submit_put_layer |
+| 保存收尾等待 | 各提交批次末层 PUT event | session 末尾记录的 finish event |
+| 树侧 offload 的作用 | 发起实际保存 | 核对已有保存 receipts，不重复 PUT |
+| 主要源数据保护 | 节点锁引用 | session 页面 pin，以及树侧确认任务自己的节点锁引用 |
+
+非 owner 不执行原生写入，提供本地确认结果参与跨 rank 汇总。普通 PUT 出错会报告失败，不能发布成功副本状态；在途工作需要排空后才可解除保护。这里的 event 完成含义是当前接口的保存完成约定，不额外承诺存储设备的掉电持久性。
+
+代码走读入口：`Wrapper.offload_nodes()` / `_offload_node()` → `OceanDiskDirectLinker.offload()` / `_offload_worker()` → `OceanDiskStorage.put_layers()`。更详细的源码断点参考 [走读笔记第 4 节](code_walkthrough_notes.md)。
 
 ## 9. 正确性与生命周期：讲解中不可省略的部分
 
