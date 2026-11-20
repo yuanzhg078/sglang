@@ -217,6 +217,12 @@ def _create_unified_radix_cache(
                 )
 
                 linker_cls = OceanDiskPDLinker
+        elif backend == "kvclient":
+            from sglang.srt.mem_cache.storage.kvclient.kvclient_direct_linker import (
+                KvClientDirectLinker,
+            )
+
+            linker_cls = KvClientDirectLinker
         elif backend == "mori":
             from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
                 UMBPDirectLinker,

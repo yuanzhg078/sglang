@@ -209,9 +209,12 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori", "oceandisk"],
+            choices=["mooncake", "mori", "oceandisk", "kvclient"],
         ),
     ] = "mooncake"
+    kvclient_config_path: A[
+        str | None, "Path to the KvClient SDK configuration file."
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
