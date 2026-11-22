@@ -1219,11 +1219,18 @@ build_layer_ranges、check_result_and_device_visibility 为说明步骤的伪代
 
 ### 8.1 逐层保存：按层入队，PUT 与前向重叠
 
-**每批准备一次。** Scheduler 在 `resolve_forward_inputs()` 后调用 `Wrapper.prepare_layerwise_save(batch)`。Wrapper 选完整页、构造 `PoolTransfer` 并保护源 slots。跨 chunk 填满的页从 `req_to_token` 取完整 slots。Linker 展开 KV 和 Indexer 两池，调用一次 `_prepare()`，调用 `saver.update_producer()` 为本批取一个 `save_index`，按该编号登记两池的 key、位置、预期本地层和本批 receipt。本轮无页待存时返回 `-1`。
+**每批准备一次。** Scheduler 在 `resolve_forward_inputs()` 后调用 `Wrapper.prepare_layerwise_save(batch)`。Wrapper 选完整页、构造 `PoolTransfer` 并保护源 slots。跨 chunk 填满的页从 `req_to_token` 取完整 slots。Linker 展开 KV 和 Indexer 两池，调用一次 `_prepare()` 整理两池的页 key 和位置。
+
+Linker 调用 `saver.update_producer()` 取得本批的 `save_index`，将两池的页 key、位置和预期本地层组成 `save_plan`，登记为 `save_plans[save_index] = save_plan`。Linker 同时登记本批页共享的 receipt Future，用来报告整批保存结果。登记完成后，Linker 返回 `save_index`，Scheduler 将它保存到 `batch.save_index`。本轮无页待存时返回 `-1`。
 
 #### LayerwiseSaver 的用法
 
-**每批只分配一个 `save_index`。** Saver 的两个字段都从 `-1` 开始。`producer_index` 记录最近分配的编号，由 Linker 调 `update_producer()` 更新。`consumer_index` 记录当前 forward 使用的编号，由 TP worker 从 `batch.save_index` 原样填入。普通 DSA forward 的 KV setter 每层调用 `save_layer(layer_id)`。
+**每批只分配一个 `save_index`。** `save_index` 是 `save_plans` 的查找键。Saver 的两个字段都从 `-1` 开始，分别记录分配进度和当前 forward 的选择。
+
+- `producer_index` 记录最近分配到哪个编号。Linker 调用 `saver.update_producer()` 时，saver 递增此字段并返回新编号。
+- `consumer_index` 记录当前 forward 使用哪个编号。TP worker 在 forward 前把 `batch.save_index` 写入此字段。普通 DSA forward 的 KV setter 只传层号 `N`，`save_layer(N)` 从 `consumer_index` 取出本批编号，将 `(save_index, N, ready_event)` 入队。
+
+如果 A 批分到 `7`，B 批在 A 的 forward 开始前已分到 `8`，执行 A 时 `producer_index` 就是 `8`，而 `consumer_index` 仍按 A 的 `batch.save_index` 设置为 `7`。第 N 层入队时应携带 `7`，后台才能查到 `save_plans[7]`。如果调用链显式传递 `batch.save_index` 到 `save_layer(N, save_index)`，就可以省去 `consumer_index`。这里将编号暂存在 saver 上，让 setter 只需传层号。
 
 ```python
 # Scheduler：解析输入后准备保存页。
@@ -1245,7 +1252,7 @@ def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, layer_id_ove
         self.layerwise_saver.save_layer(layer_id)
 ```
 
-例如，A 批分到 `7`，第 3 层入队时就写定 `(7, 3, ready_event)`。普通和 overlap Scheduler 在同一个 TP worker 上串行调用 Python forward，因此 A 退出后可以清空 `consumer_index`，再为 B 设置 `8`。即使此时 A 的 PUT 仍在执行，卸载线程也会按队列里的 `7` 查 `save_plans[7]`，取出 A 的保存页。
+普通和 overlap Scheduler 在同一个 TP worker 上串行调用 Python forward。A 退出后，TP worker 清空 `consumer_index`，再在 B 的 forward 前将它设为 `8`。即使 A 的后台保存仍在进行，卸载线程也会用 A 的任务入队时携带的 `7` 查 `save_plans[7]`。
 
 **图 A　Scheduler 在 forward 前准备保存计划**
 
@@ -1254,6 +1261,7 @@ sequenceDiagram
     participant S as Scheduler
     participant W as Wrapper
     participant L as KvClientDirectLinker
+    participant V as LayerwiseSaver
     participant T as TP worker
 
     S->>S: resolve_forward_inputs(batch)
@@ -1262,7 +1270,10 @@ sequenceDiagram
     W->>L: begin_layerwise_save(transfers, phase)
     L->>L: resolve_transfers() 展开 KV 和 Indexer 两池
     L->>L: _prepare() 整理两池的页 key 和位置
-    L->>L: 调用 saver.update_producer() 取号，登记计划和 receipt
+    L->>V: update_producer()
+    V-->>L: 返回新分配的 save_index
+    L->>L: save_plans[save_index] = save_plan
+    L->>L: 登记本批页共享的 receipt Future
     L-->>W: 返回 save_index
     W-->>S: 返回 save_index
     S->>S: 将 save_index 写入 ScheduleBatch
@@ -1283,7 +1294,8 @@ sequenceDiagram
     D->>D: 提交第 N 层 Indexer 写入
     D->>P: set_mla_kv_buffer() 提交第 N 层 KV 写入
     P->>S: setter 内调用 save_layer(N)
-    S->>S: save_index = consumer_index，记录本层 ready_event
+    S->>S: 从 consumer_index 取出本批 save_index
+    S->>S: 记录本层 ready_event
     S-)W: offload_queue 入队 (save_index, N, ready_event)
     S-->>P: 入队后返回
     P-->>D: setter 返回
