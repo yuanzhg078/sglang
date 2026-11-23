@@ -6,7 +6,7 @@
 
 **Interleave CP 决定每张卡算哪些 token，layer split 决定每张卡长期保留哪些层的缓存。** 开关两边都一样的是，每个 CP rank 在每个 attention 层计算自己负责的新 token 的 Q、KV 和 Indexer 数据。需要完整的新 KV 和 Indexer 数据时，各 rank 通过 all-gather 汇集各自算出的部分，并还原 token 顺序。每个 rank 仍只计算自己那部分 query 的 attention 输出。
 
-All-gather 的结果也在每张卡的 HBM 里。区别在于后面写到哪里。`kv_buffer[layer]` 给这一层提供独立的常驻缓存，后续 forward 可以按 slot 找到这层的旧 KV。拆层时，只有该层 owner 有这份常驻 buffer。其他 rank 可以使用一层大小的 `remote_kv_buffer`，它可以装当前层，也可以被下一层覆盖。Indexer 有对应的常驻缓存和工作区。[All-gather 后恢复 token 顺序](python/sglang/srt/layers/cp/interleave.py) · [拆层 pool 的常驻 buffer 和工作区](python/sglang/srt/mem_cache/dsa_cache_layer_split.py)
+All-gather 的结果也在每张卡的 HBM 里。`kv_buffer[layer]` 给这一层提供独立的常驻缓存，后续 forward 可以按 slot 找到这层的旧 KV。拆层时，只有该层 owner 有这份常驻 buffer。每个 CP rank 还有一块一层大小的 `remote_kv_buffer`，用于广播发送或接收，随层复用。Indexer 也有自己的常驻缓存和一层大小的临时 `remote_buffer`。 [All-gather 后恢复 token 顺序](python/sglang/srt/layers/cp/interleave.py) · [拆层 pool 的常驻 buffer 和工作区](python/sglang/srt/mem_cache/dsa_cache_layer_split.py)
 
 ### 1.1 四个 CP rank：开启和关闭 layer split
 
@@ -43,10 +43,21 @@ All-gather 的结果也在每张卡的 HBM 里。区别在于后面写到哪里�
 
 1. **各 rank 计算本地 token。** 两张卡分别对本地 token 做投影。该层需要完整 token 顺序的新 KV 和 Indexer 数据时，interleave 策略通过 CP all-gather 拼回所需的序列顺序。 [Interleave 数据收集](python/sglang/srt/layers/cp/interleave.py)
 2. **该层 owner 写入常驻缓存。** 新 token 对应的 MLA KV 和 Indexer 数据由 CP1 写进第 40 层的常驻 buffer。CP0 的第 40 层对应位置是零行占位，它在计算时使用临时工作 buffer。 [拆层 pool 的缓存写入](python/sglang/srt/mem_cache/dsa_cache_layer_split.py)
-3. **各 rank 按需取这一层的数据。** 需要访问第 40 层已有缓存时，DSA pool 通过 CP 广播用 CP1 的常驻 buffer 填充各 rank 的临时工作 buffer。同一层的数据已在临时 buffer 内时可以直接复用。在读取 Indexer 时，pool 也可以提前准备同一层的 KV。 [拆层 pool 的广播读取](python/sglang/srt/mem_cache/dsa_cache_layer_split.py)
+3. **各 rank 按需取这一层的数据。** 需要访问第 40 层已有缓存且临时副本尚未就绪时，各 rank 参加同一次 CP 广播。本层 owner 提供广播源，其余 rank 接收到各自的临时 buffer。在读取 Indexer 时，pool 也可以提前准备同一层的 KV。 [拆层 pool 的广播读取](python/sglang/srt/mem_cache/dsa_cache_layer_split.py)
 4. **各 rank 算自己的 attention 输出。** 本地 query 先用这一层的 Indexer 找出可访问的候选位置，再用对应的 MLA KV 做 attention。CP0 计算自己的 query，CP1 也计算自己的 query。当前层的 attention 结束后，模型可以预取下一层的 KV，尝试让广播与后续计算重叠。 [下一层 KV 预取](python/sglang/srt/layers/communicator_dsa_cp.py)
 
-这里有两种 CP 通信。**All-gather 收集各 rank 刚算出的 token 数据，owner 广播让各 rank 访问某一层已有的缓存。** 广播可以在本轮新 token 写入前完成。如果该层的临时 KV 副本已准备好，`set_mla_kv_buffer()` 也会把本轮新 token 补进这个副本。普通前向的 GPU 间广播由 DSA pool 实现。接入 KvClient GET 后，同一层的广播源可以来自 ASU 刚恢复的数据，此时该层 owner 先等本地 GET 就绪再广播，详见第 6 节。
+#### 广播时临时 buffer 怎么用
+
+DSA pool 调用 `_broadcast_tensor_from_owner()`，把该层 owner 指定为 CP 组广播的源 rank。各 rank 都传入自己的临时 buffer。owner 先把该层的常驻数据复制到自己的临时 buffer，再用这块 buffer 发送。其余 rank 用各自的临时 buffer 接收。
+
+| 广播的原始层号 | CP0 的 `remote_kv_buffer` | CP1 的 `remote_kv_buffer` |
+| --- | --- | --- |
+| `38`，归 CP0 | 从本地第 `38` 层常驻 KV 复制数据，用于发送 | 接收第 `38` 层 KV |
+| `39`，归 CP1 | 接收第 `39` 层 KV | 从本地第 `39` 层常驻 KV 复制数据，用于发送 |
+
+同一块临时 buffer 的发送或接收角色随当前层的 owner 变化。各层原始 KV 仍保留在各自 owner 的常驻 buffer 中。Indexer 使用自己的临时 `remote_buffer`，单独广播该层的 Indexer 数据。 [广播源和临时 buffer](python/sglang/srt/mem_cache/dsa_cache_layer_split.py#L271)
+
+**All-gather 收集各 rank 刚算出的 token 数据，owner 广播让各 rank 访问某一层已有的缓存。** 广播可以在本轮新 token 写入前完成。如果该层的临时 KV 副本已准备好，`set_mla_kv_buffer()` 也会把本轮新 token 补进这个副本。接入 KvClient GET 后，若该层从 ASU 恢复，owner 先等本地常驻 buffer 的 GET 就绪，再沿用上述广播，详见第 6 节。
 
 ## 2. DevicePoolGroup、DevicePoolEntry 和内存注册
 
