@@ -124,7 +124,7 @@ sequenceDiagram
 
 `make_cache_key(page_key)` 沿用原来的编码。KV、Indexer 和不同 CP owner 写出的片段都使用同一个数据 key。远端布局仍是全部 KV 片段在前，全部 Indexer 片段在后。
 
-在注册 MR 之前，`_build_remote_layout()` 生成 `_storage_offsets`。完整副本沿用现有构建路径。**拆层时，每个 rank 只为自己持有层的 `(pool, layer, fragment)` 建表项，表里的值是该片段在完整 ASU 页里的字节偏移。** 对连续层分片，可以按下面的方式算出本地片段的远端位置。
+在注册 MR 之前，`_build_remote_layout()` 生成 `_storage_offsets`。完整副本沿用现有构建路径。**拆层时，每个 rank 只为自己持有层的 `(pool, layer_id)` 建表项。** `layer_id` 是原始模型层号。DSA 每页每层在 KV 和 Indexer 池各有一个片段，表里的值是该片段在完整 ASU 页里的字节偏移。对连续层分片，可以按下面的方式算出本地片段的远端位置。
 
 ```text
 KV offset      = 前面 CP 分片的 KV 对齐总字节数 + 本分片内的 KV 对齐偏移
@@ -140,17 +140,17 @@ Indexer offset = 全部层的 KV 对齐总字节数
 沿用第 2.1 节的例子。模型有 8 层、CP=4，CP1 只持有原始层 `2、3`。假设每页每层的 KV 是 `73728` 字节，Indexer 是 `8448` 字节，两池每层各有一个片段。CP1 的表如下。
 
 ```python
-# key = (池名, 原始模型层号, 该池该层的片段下标)
+# key = (池名, 原始模型层号)
 # value = 在完整 ASU 页内的字节偏移
 _storage_offsets = {
-    (PoolName.KV,      2, 0): 147456,  # 2 × 73728
-    (PoolName.KV,      3, 0): 221184,  # 3 × 73728
-    (PoolName.INDEXER, 2, 0): 607232,  # 8 × 73728 + 2 × 8704
-    (PoolName.INDEXER, 3, 0): 615936,  # 8 × 73728 + 3 × 8704
+    (PoolName.KV,      2): 147456,  # 2 × 73728
+    (PoolName.KV,      3): 221184,  # 3 × 73728
+    (PoolName.INDEXER, 2): 607232,  # 8 × 73728 + 2 × 8704
+    (PoolName.INDEXER, 3): 615936,  # 8 × 73728 + 3 × 8704
 }
 ```
 
-例如准备原始第 `2` 层的 Indexer GET 时，`entry.layer_mapping[2]` 得到本地 buffer 下标 `0`，用于计算目标 GPU 地址。`_storage_offsets[(PoolName.INDEXER, 2, 0)]` 得到 `607232`，用于定位远端数据。这里元组末尾的 `0` 是片段下标。Indexer 的远端基址 `8 × 73728` 由整页的 8 层 KV 决定，CP1 的字典只存自己负责的两层。
+例如准备原始第 `2` 层的 Indexer GET 时，`entry.layer_mapping[2]` 得到本地 buffer 下标 `0`，用于计算目标 GPU 地址。`_storage_offsets[(PoolName.INDEXER, 2)]` 用原始层号查到远端偏移 `607232`。Indexer 的远端基址 `8 × 73728` 由整页的 8 层 KV 决定，CP1 的字典只存自己负责的两层。
 
 ### 3.2 78 层布局示例
 
