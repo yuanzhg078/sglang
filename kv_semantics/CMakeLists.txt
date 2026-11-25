@@ -32,14 +32,19 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif()
 endif()
 
-if(NOT (RUNTIME_ENVIRONMENT STREQUAL "ascend" OR RUNTIME_ENVIRONMENT STREQUAL "simu"))
-    message(FATAL_ERROR
-        "kv client requires RUNTIME_ENVIRONMENT=ascend or simu. Current value: ${RUNTIME_ENVIRONMENT}")
-endif()
-
 option(BUILD_KV_CLIENT_PROVIDER_AICPU "Build KV AICPU trans provider" OFF)
 option(BUILD_KV_CLIENT_PROVIDER_FAKE "Build KV fake trans provider" ON)
 option(BUILD_KV_CLIENT_PROVIDER_AIV "Build KV AIV trans provider (requires external libumc.a)" OFF)
+
+if(RUNTIME_ENVIRONMENT STREQUAL "cuda" AND BUILD_KV_CLIENT_PROVIDER_FAKE
+    AND NOT BUILD_KV_CLIENT_PROVIDER_AICPU AND NOT BUILD_KV_CLIENT_PROVIDER_AIV)
+    # Keep the parent UCM build on CUDA while the fake KvClient uses the simulator.
+    message(STATUS "KvClient: using the simu runtime for the CUDA fake-provider build")
+    set(RUNTIME_ENVIRONMENT "simu")
+elseif(NOT (RUNTIME_ENVIRONMENT STREQUAL "ascend" OR RUNTIME_ENVIRONMENT STREQUAL "simu"))
+    message(FATAL_ERROR
+        "KvClient requires RUNTIME_ENVIRONMENT=ascend or simu, or cuda with only the fake provider. Current value: ${RUNTIME_ENVIRONMENT}")
+endif()
 
 add_subdirectory(metrics)
 add_subdirectory(src)

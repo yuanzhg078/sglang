@@ -35,15 +35,6 @@ ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 PLATFORM = os.getenv("PLATFORM")
 ENABLE_SPARSE = os.getenv("ENABLE_SPARSE")
 BUILD_UCM_ASU = os.getenv("BUILD_UCM_ASU", "0") not in ("", "0", "false", "False")
-BUILD_KV_CLIENT_PROVIDER_AIV = os.getenv("BUILD_KV_CLIENT_PROVIDER_AIV", "0") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
-BUILD_KV_CLIENT_PROVIDER_AICPU = os.getenv(
-    "BUILD_KV_CLIENT_PROVIDER_AICPU", "0"
-) not in ("", "0", "false", "False")
 ENABLE_MINDIE = os.getenv("UCM_ENABLE_MINDIE", "0") not in ("", "0", "false", "False")
 ENABLE_GDR = os.getenv("ENABLE_GDR", "0") not in ("", "0", "false", "False")
 ASCEND_ROOT = os.getenv("ASCEND_ROOT")
@@ -200,10 +191,15 @@ class CMakeBuild(build_ext):
 
         if BUILD_UCM_ASU:
             cmake_args += ["-DBUILD_UCM_ASU=ON"]
-        if BUILD_KV_CLIENT_PROVIDER_AIV:
-            cmake_args += ["-DBUILD_KV_CLIENT_PROVIDER_AIV=ON"]
-        if BUILD_KV_CLIENT_PROVIDER_AICPU:
-            cmake_args += ["-DBUILD_KV_CLIENT_PROVIDER_AICPU=ON"]
+        for provider_option in (
+            "BUILD_KV_CLIENT_PROVIDER_AIV",
+            "BUILD_KV_CLIENT_PROVIDER_AICPU",
+            "BUILD_KV_CLIENT_PROVIDER_FAKE",
+        ):
+            value = os.getenv(provider_option)
+            if value is not None:
+                enabled = "OFF" if value.lower() in ("", "0", "false", "off") else "ON"
+                cmake_args.append(f"-D{provider_option}={enabled}")
 
         if ENABLE_GDR:
             cmake_args += ["-DUCM_ENABLE_GDR_STREAM=ON"]
